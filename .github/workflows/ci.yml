@@ -18,6 +18,8 @@ jobs:
         with:
           python-version: "3.x"
       - name: Shell syntax
-        run: bash -n scripts/*.sh tests/test_codex_launchd_scripts.sh
+        run: |
+          bash -n scripts/*.sh tests/test_codex_launchd_scripts.sh
       - name: Run smoke tests
-        run: bash tests/test_codex_launchd_scripts.sh
+        run: |
+          bash tests/test_codex_launchd_scripts.sh
