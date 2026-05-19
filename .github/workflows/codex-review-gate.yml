@@ -1,0 +1,40 @@
+name: Codex Review Gate
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  schedule:
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Pull request number to gate.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: codex-review-gate-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  codex-review-gate:
+    name: codex/review-gate runner
+    runs-on: ${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    steps:
+      - name: Gate on Codex review
+        uses: JoeyTeng/codex-review-gate-action@v1.2.1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pull-request: ${{ inputs.pull_request || '' }}
