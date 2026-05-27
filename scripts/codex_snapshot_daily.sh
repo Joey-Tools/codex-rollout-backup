@@ -33,6 +33,13 @@ copy_snapshot_to_publish_tmp() {
   return "$status"
 }
 
+preserve_staged_snapshot_for_recovery() {
+  local staged_path="$1"
+
+  [ -n "$staged_path" ] || return 0
+  echo "Preserving staged snapshot for manual recovery: $staged_path" >> "$LOG"
+}
+
 publish_snapshot() {
   local tmp_path="$1"
   local final_path="$2"
@@ -68,7 +75,7 @@ publish_snapshot() {
     attempt=$((attempt + 1))
   done
 
-  echo "Snapshot publish rename failed after $attempts attempts: $tmp_path -> $final_path; leaving temp file for manual recovery" >> "$LOG"
+  echo "Snapshot publish rename failed after $attempts attempts: $tmp_path -> $final_path" >> "$LOG"
   return "$status"
 }
 
@@ -103,15 +110,23 @@ mkdir -p "$SNAPSHOT_STAGING_DIR"
 if command -v zstd >/dev/null 2>&1; then
   echo "Creating zstd snapshot..." >> "$LOG"
   TMP_OUT="$SNAPSHOT_STAGING_DIR/$(basename "$OUT_BASE.zst").tmp.$$"
-  PUBLISH_OUT="$OUT_BASE.zst.tmp.$$"
+  PUBLISH_OUT="$OUT_BASE.zst.publish.tmp.$$"
   (cd "$CODEX_MIRROR_ROOT" && tar -cf - -T "$TMP_LIST") | zstd -q -T0 -f -o "$TMP_OUT"
-  if ! copy_snapshot_to_publish_tmp "$TMP_OUT" "$PUBLISH_OUT"; then
+  if copy_snapshot_to_publish_tmp "$TMP_OUT" "$PUBLISH_OUT"; then
+    :
+  else
+    snapshot_status=$?
+    preserve_staged_snapshot_for_recovery "$TMP_OUT"
     TMP_OUT=""
-    exit 1
+    exit "$snapshot_status"
   fi
-  if ! publish_snapshot "$PUBLISH_OUT" "$OUT_BASE.zst"; then
+  if publish_snapshot "$PUBLISH_OUT" "$OUT_BASE.zst"; then
+    :
+  else
+    snapshot_status=$?
+    preserve_staged_snapshot_for_recovery "$TMP_OUT"
     TMP_OUT=""
-    exit 1
+    exit "$snapshot_status"
   fi
   PUBLISH_OUT=""
   rm -f "$TMP_OUT"
@@ -120,15 +135,23 @@ if command -v zstd >/dev/null 2>&1; then
 else
   echo "Creating gzip snapshot..." >> "$LOG"
   TMP_OUT="$SNAPSHOT_STAGING_DIR/$(basename "$OUT_BASE.gz").tmp.$$"
-  PUBLISH_OUT="$OUT_BASE.gz.tmp.$$"
+  PUBLISH_OUT="$OUT_BASE.gz.publish.tmp.$$"
   (cd "$CODEX_MIRROR_ROOT" && tar -cf - -T "$TMP_LIST") | gzip -c > "$TMP_OUT"
-  if ! copy_snapshot_to_publish_tmp "$TMP_OUT" "$PUBLISH_OUT"; then
+  if copy_snapshot_to_publish_tmp "$TMP_OUT" "$PUBLISH_OUT"; then
+    :
+  else
+    snapshot_status=$?
+    preserve_staged_snapshot_for_recovery "$TMP_OUT"
     TMP_OUT=""
-    exit 1
+    exit "$snapshot_status"
   fi
-  if ! publish_snapshot "$PUBLISH_OUT" "$OUT_BASE.gz"; then
+  if publish_snapshot "$PUBLISH_OUT" "$OUT_BASE.gz"; then
+    :
+  else
+    snapshot_status=$?
+    preserve_staged_snapshot_for_recovery "$TMP_OUT"
     TMP_OUT=""
-    exit 1
+    exit "$snapshot_status"
   fi
   PUBLISH_OUT=""
   rm -f "$TMP_OUT"

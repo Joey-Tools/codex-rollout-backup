@@ -695,6 +695,31 @@ test_snapshot_retries_transient_publish_rename_failure() {
   cleanup_home "$tmp_home"
 }
 
+test_snapshot_allows_staging_dir_to_match_snapshot_dir() {
+  local tmp_home archive_path snapshot_dir src_file
+
+  tmp_home="$(new_home)"
+  archive_path="$(snapshot_archive_path "$tmp_home")"
+  snapshot_dir="$(dirname "$archive_path")"
+  src_file="$tmp_home/.codex/sessions/day/rollout-staging-in-snapshot-dir.jsonl"
+
+  mkdir -p "$(dirname "$src_file")"
+  printf '{"step":1}\n' > "$src_file"
+
+  HOME="$tmp_home" \
+  CODEX_SNAPSHOT_STAGING_DIR="$snapshot_dir" \
+  bash "$SNAPSHOT_SCRIPT"
+
+  assert_file_exists "$archive_path"
+  assert_archive_contains "$archive_path" "sessions/day/rollout-staging-in-snapshot-dir.jsonl"
+  if find "$snapshot_dir" -name '*.tmp.*' -print | grep -q .; then
+    printf 'Did not expect snapshot tmp files to remain when staging uses snapshot dir\n' >&2
+    exit 1
+  fi
+
+  cleanup_home "$tmp_home"
+}
+
 test_snapshot_sanitizes_invalid_publish_rename_delay() {
   local tmp_home archive_path log_path fake_bin mv_state sleep_state src_file staging_dir
 
@@ -759,6 +784,8 @@ test_snapshot_preserves_staging_file_when_publish_retries_are_exhausted() {
 
   assert_not_exists "$archive_path"
   assert_contains "$log_path" "Snapshot publish rename failed after 1 attempts"
+  assert_contains "$log_path" "Preserving staged snapshot for manual recovery: $staging_dir/"
+  assert_not_contains "$log_path" "leaving temp file for manual recovery"
   if ! find "$staging_dir" -name '*.tmp.*' -print | grep -q .; then
     printf 'Expected snapshot tmp file to remain in staging after publish failure\n' >&2
     exit 1
@@ -772,7 +799,7 @@ test_snapshot_preserves_staging_file_when_publish_retries_are_exhausted() {
 }
 
 test_snapshot_preserves_staging_file_when_publish_copy_fails() {
-  local tmp_home archive_path log_path fake_bin state_dir src_file staging_dir snapshot_dir
+  local tmp_home archive_path log_path fake_bin state_dir src_file staging_dir snapshot_dir status
 
   tmp_home="$(new_home)"
   archive_path="$(snapshot_archive_path "$tmp_home")"
@@ -787,13 +814,21 @@ test_snapshot_preserves_staging_file_when_publish_copy_fails() {
   setup_fake_cp_publish_failure "$fake_bin/cp"
   printf '{"step":1}\n' > "$src_file"
 
-  if HOME="$tmp_home" \
+  set +e
+  HOME="$tmp_home" \
     PATH="$fake_bin:$PATH" \
     CODEX_SNAPSHOT_STAGING_DIR="$staging_dir" \
     TMP_FAKE_CP_STATE="$state_dir" \
     TMP_FAKE_CP_FAIL_DIR="$snapshot_dir" \
-    bash "$SNAPSHOT_SCRIPT"; then
+    bash "$SNAPSHOT_SCRIPT"
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
     printf 'Expected snapshot script to fail after publish copy failure\n' >&2
+    exit 1
+  fi
+  if [ "$status" -ne 73 ]; then
+    printf 'Expected publish copy failure exit status 73, got %s\n' "$status" >&2
     exit 1
   fi
 
@@ -986,6 +1021,7 @@ test_snapshot_skips_rolled_back_relocation_after_disappear_during_mirror_sync
 test_snapshot_skips_empty_source
 test_snapshot_can_rerun_same_day
 test_snapshot_retries_transient_publish_rename_failure
+test_snapshot_allows_staging_dir_to_match_snapshot_dir
 test_snapshot_sanitizes_invalid_publish_rename_delay
 test_snapshot_preserves_staging_file_when_publish_retries_are_exhausted
 test_snapshot_preserves_staging_file_when_publish_copy_fails
