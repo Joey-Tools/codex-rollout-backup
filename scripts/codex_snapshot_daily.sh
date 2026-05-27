@@ -14,6 +14,43 @@ mkdir -p "$SNAP_DIR" "$(dirname "$LOG")"
 . "$SCRIPT_DIR/onedrive_unpin_common.sh"
 DATE="$(date +%Y-%m-%d)"
 OUT_BASE="$SNAP_DIR/codex-rollouts-$DATE.tar"
+SNAPSHOT_STAGING_DIR="${CODEX_SNAPSHOT_STAGING_DIR:-$CODEX_BACKUP_STATE_ROOT/snapshot-tmp}"
+
+publish_snapshot() {
+  local tmp_path="$1"
+  local final_path="$2"
+  local attempts="${CODEX_SNAPSHOT_PUBLISH_RENAME_ATTEMPTS:-12}"
+  local delay_seconds="${CODEX_SNAPSHOT_PUBLISH_RENAME_DELAY_SECONDS:-5}"
+  local attempt=1
+  local status=1
+
+  if ! [[ "$attempts" =~ ^[0-9]+$ ]] || [ "$attempts" -lt 1 ]; then
+    attempts=1
+  fi
+
+  while [ "$attempt" -le "$attempts" ]; do
+    if mv -f "$tmp_path" "$final_path"; then
+      return 0
+    else
+      status=$?
+    fi
+
+    if [ ! -e "$tmp_path" ]; then
+      echo "Snapshot publish failed and temp file is missing: $tmp_path -> $final_path" >> "$LOG"
+      return "$status"
+    fi
+
+    if [ "$attempt" -lt "$attempts" ]; then
+      echo "Snapshot publish rename failed (attempt $attempt/$attempts): $tmp_path -> $final_path; retrying in ${delay_seconds}s" >> "$LOG"
+      sleep "$delay_seconds"
+    fi
+
+    attempt=$((attempt + 1))
+  done
+
+  echo "Snapshot publish rename failed after $attempts attempts: $tmp_path -> $final_path; leaving temp file for manual recovery" >> "$LOG"
+  return "$status"
+}
 
 echo "==== $(date) ====" >> "$LOG"
 
@@ -41,18 +78,26 @@ if [ ! -s "$TMP_LIST" ]; then
   exit 0
 fi
 
+mkdir -p "$SNAPSHOT_STAGING_DIR"
+
 if command -v zstd >/dev/null 2>&1; then
   echo "Creating zstd snapshot..." >> "$LOG"
-  TMP_OUT="$OUT_BASE.zst.tmp.$$"
+  TMP_OUT="$SNAPSHOT_STAGING_DIR/$(basename "$OUT_BASE.zst").tmp.$$"
   (cd "$CODEX_MIRROR_ROOT" && tar -cf - -T "$TMP_LIST") | zstd -q -T0 -f -o "$TMP_OUT"
-  mv "$TMP_OUT" "$OUT_BASE.zst"
+  if ! publish_snapshot "$TMP_OUT" "$OUT_BASE.zst"; then
+    TMP_OUT=""
+    exit 1
+  fi
   TMP_OUT=""
   SNAP_FILE="$OUT_BASE.zst"
 else
   echo "Creating gzip snapshot..." >> "$LOG"
-  TMP_OUT="$OUT_BASE.gz.tmp.$$"
+  TMP_OUT="$SNAPSHOT_STAGING_DIR/$(basename "$OUT_BASE.gz").tmp.$$"
   (cd "$CODEX_MIRROR_ROOT" && tar -cf - -T "$TMP_LIST") | gzip -c > "$TMP_OUT"
-  mv "$TMP_OUT" "$OUT_BASE.gz"
+  if ! publish_snapshot "$TMP_OUT" "$OUT_BASE.gz"; then
+    TMP_OUT=""
+    exit 1
+  fi
   TMP_OUT=""
   SNAP_FILE="$OUT_BASE.gz"
 fi
