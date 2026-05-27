@@ -48,7 +48,7 @@ publish_snapshot() {
   local attempt=1
   local status=1
 
-  if ! [[ "$attempts" =~ ^[0-9]+$ ]] || [ "$attempts" -lt 1 ]; then
+  if ! [[ "$attempts" =~ ^[0-9]+$ ]] || [ "${#attempts}" -gt 4 ] || [ "$attempts" -lt 1 ]; then
     attempts=1
   fi
   if ! [[ "$delay_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]; then

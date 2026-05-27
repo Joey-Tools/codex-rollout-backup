@@ -720,6 +720,28 @@ test_snapshot_allows_staging_dir_to_match_snapshot_dir() {
   cleanup_home "$tmp_home"
 }
 
+test_snapshot_sanitizes_invalid_publish_rename_attempts() {
+  local tmp_home archive_path err_path src_file
+
+  tmp_home="$(new_home)"
+  archive_path="$(snapshot_archive_path "$tmp_home")"
+  err_path="$tmp_home/bad-attempts.err"
+  src_file="$tmp_home/.codex/sessions/day/rollout-publish-bad-attempts.jsonl"
+
+  mkdir -p "$(dirname "$src_file")"
+  printf '{"step":1}\n' > "$src_file"
+
+  HOME="$tmp_home" \
+  CODEX_SNAPSHOT_PUBLISH_RENAME_ATTEMPTS=999999999999999999999999 \
+  bash "$SNAPSHOT_SCRIPT" 2>"$err_path"
+
+  assert_file_exists "$archive_path"
+  assert_archive_contains "$archive_path" "sessions/day/rollout-publish-bad-attempts.jsonl"
+  assert_not_contains "$err_path" "integer expression expected"
+
+  cleanup_home "$tmp_home"
+}
+
 test_snapshot_sanitizes_invalid_publish_rename_delay() {
   local tmp_home archive_path log_path fake_bin mv_state sleep_state src_file staging_dir
 
@@ -1022,6 +1044,7 @@ test_snapshot_skips_empty_source
 test_snapshot_can_rerun_same_day
 test_snapshot_retries_transient_publish_rename_failure
 test_snapshot_allows_staging_dir_to_match_snapshot_dir
+test_snapshot_sanitizes_invalid_publish_rename_attempts
 test_snapshot_sanitizes_invalid_publish_rename_delay
 test_snapshot_preserves_staging_file_when_publish_retries_are_exhausted
 test_snapshot_preserves_staging_file_when_publish_copy_fails
