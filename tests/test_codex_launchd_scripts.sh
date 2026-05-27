@@ -186,6 +186,31 @@ EOF
   chmod +x "$cp_path"
 }
 
+setup_fake_validating_sleep() {
+  local sleep_path="$1"
+
+  mkdir -p "$(dirname "$sleep_path")"
+  cat > "$sleep_path" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+state_dir="${TMP_FAKE_SLEEP_STATE:?}"
+log_file="$state_dir/sleep.log"
+delay="${1:-}"
+
+mkdir -p "$state_dir"
+printf 'sleep %s\n' "$delay" >> "$log_file"
+
+if [[ "$delay" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  exit 0
+fi
+
+printf 'sleep: invalid time interval %s\n' "$delay" >&2
+exit 97
+EOF
+  chmod +x "$sleep_path"
+}
+
 setup_disappear_hook() {
   local hook_path="$1"
 
@@ -670,6 +695,41 @@ test_snapshot_retries_transient_publish_rename_failure() {
   cleanup_home "$tmp_home"
 }
 
+test_snapshot_sanitizes_invalid_publish_rename_delay() {
+  local tmp_home archive_path log_path fake_bin mv_state sleep_state src_file staging_dir
+
+  tmp_home="$(new_home)"
+  archive_path="$(snapshot_archive_path "$tmp_home")"
+  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
+  fake_bin="$tmp_home/fake-bin"
+  mv_state="$tmp_home/fake-mv-state"
+  sleep_state="$tmp_home/fake-sleep-state"
+  src_file="$tmp_home/.codex/sessions/day/rollout-publish-bad-delay.jsonl"
+  staging_dir="$tmp_home/snapshot-staging"
+
+  mkdir -p "$(dirname "$src_file")"
+  setup_fake_mv_once "$fake_bin/mv"
+  setup_fake_validating_sleep "$fake_bin/sleep"
+  printf '{"step":1}\n' > "$src_file"
+
+  HOME="$tmp_home" \
+  PATH="$fake_bin:$PATH" \
+  CODEX_SNAPSHOT_STAGING_DIR="$staging_dir" \
+  CODEX_SNAPSHOT_PUBLISH_RENAME_ATTEMPTS=2 \
+  CODEX_SNAPSHOT_PUBLISH_RENAME_DELAY_SECONDS=bad \
+  TMP_FAKE_MV_STATE="$mv_state" \
+  TMP_FAKE_MV_FAIL_DST="$archive_path" \
+  TMP_FAKE_SLEEP_STATE="$sleep_state" \
+  bash "$SNAPSHOT_SCRIPT"
+
+  assert_file_exists "$archive_path"
+  assert_archive_contains "$archive_path" "sessions/day/rollout-publish-bad-delay.jsonl"
+  assert_contains "$log_path" "Snapshot publish rename failed (attempt 1/2)"
+  assert_contains "$sleep_state/sleep.log" "sleep 5"
+
+  cleanup_home "$tmp_home"
+}
+
 test_snapshot_preserves_staging_file_when_publish_retries_are_exhausted() {
   local tmp_home archive_path log_path fake_bin state_dir src_file staging_dir
 
@@ -926,6 +986,7 @@ test_snapshot_skips_rolled_back_relocation_after_disappear_during_mirror_sync
 test_snapshot_skips_empty_source
 test_snapshot_can_rerun_same_day
 test_snapshot_retries_transient_publish_rename_failure
+test_snapshot_sanitizes_invalid_publish_rename_delay
 test_snapshot_preserves_staging_file_when_publish_retries_are_exhausted
 test_snapshot_preserves_staging_file_when_publish_copy_fails
 test_snapshot_uses_existing_mirror_when_source_missing

@@ -44,6 +44,9 @@ publish_snapshot() {
   if ! [[ "$attempts" =~ ^[0-9]+$ ]] || [ "$attempts" -lt 1 ]; then
     attempts=1
   fi
+  if ! [[ "$delay_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    delay_seconds=5
+  fi
 
   while [ "$attempt" -le "$attempts" ]; do
     if mv -f "$tmp_path" "$final_path"; then
