@@ -24,9 +24,10 @@ copy_snapshot_to_publish_tmp() {
   rm -f "$publish_tmp" 2>/dev/null || true
   if cp -p "$staged_path" "$publish_tmp"; then
     return 0
+  else
+    local status=$?
   fi
 
-  local status=$?
   rm -f "$publish_tmp" 2>/dev/null || true
   echo "Snapshot publish copy failed: $staged_path -> $publish_tmp" >> "$LOG"
   return "$status"

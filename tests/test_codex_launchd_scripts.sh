@@ -157,6 +157,35 @@ EOF
   chmod +x "$mv_path"
 }
 
+setup_fake_cp_publish_failure() {
+  local cp_path="$1"
+
+  mkdir -p "$(dirname "$cp_path")"
+  cat > "$cp_path" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+state_dir="${TMP_FAKE_CP_STATE:?}"
+fail_dir="${TMP_FAKE_CP_FAIL_DIR:?}"
+log_file="$state_dir/cp.log"
+dst="${@: -1}"
+
+mkdir -p "$state_dir"
+printf 'cp %s\n' "$*" >> "$log_file"
+
+case "$dst" in
+  "$fail_dir"/codex-rollouts-*.tar.*.tmp.*)
+    printf 'partial publish tmp\n' > "$dst"
+    printf 'cp: simulated publish copy failure for %s\n' "$dst" >&2
+    exit 73
+    ;;
+esac
+
+exec /bin/cp "$@"
+EOF
+  chmod +x "$cp_path"
+}
+
 setup_disappear_hook() {
   local hook_path="$1"
 
@@ -682,6 +711,47 @@ test_snapshot_preserves_staging_file_when_publish_retries_are_exhausted() {
   cleanup_home "$tmp_home"
 }
 
+test_snapshot_preserves_staging_file_when_publish_copy_fails() {
+  local tmp_home archive_path log_path fake_bin state_dir src_file staging_dir snapshot_dir
+
+  tmp_home="$(new_home)"
+  archive_path="$(snapshot_archive_path "$tmp_home")"
+  snapshot_dir="$(dirname "$archive_path")"
+  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
+  fake_bin="$tmp_home/fake-bin"
+  state_dir="$tmp_home/fake-cp-state"
+  src_file="$tmp_home/.codex/sessions/day/rollout-publish-copy-fails.jsonl"
+  staging_dir="$tmp_home/snapshot-staging"
+
+  mkdir -p "$(dirname "$src_file")"
+  setup_fake_cp_publish_failure "$fake_bin/cp"
+  printf '{"step":1}\n' > "$src_file"
+
+  if HOME="$tmp_home" \
+    PATH="$fake_bin:$PATH" \
+    CODEX_SNAPSHOT_STAGING_DIR="$staging_dir" \
+    TMP_FAKE_CP_STATE="$state_dir" \
+    TMP_FAKE_CP_FAIL_DIR="$snapshot_dir" \
+    bash "$SNAPSHOT_SCRIPT"; then
+    printf 'Expected snapshot script to fail after publish copy failure\n' >&2
+    exit 1
+  fi
+
+  assert_not_exists "$archive_path"
+  assert_contains "$log_path" "Snapshot publish copy failed"
+  assert_contains "$state_dir/cp.log" "$snapshot_dir"
+  if ! find "$staging_dir" -name '*.tmp.*' -print | grep -q .; then
+    printf 'Expected snapshot tmp file to remain in staging after publish copy failure\n' >&2
+    exit 1
+  fi
+  if find "$snapshot_dir" -name '*.tmp.*' -print | grep -q .; then
+    printf 'Did not expect snapshot publish tmp files to remain under OneDrive snapshots\n' >&2
+    exit 1
+  fi
+
+  cleanup_home "$tmp_home"
+}
+
 test_snapshot_uses_existing_mirror_when_source_missing() {
   local tmp_home archive_path mirror_file
 
@@ -857,6 +927,7 @@ test_snapshot_skips_empty_source
 test_snapshot_can_rerun_same_day
 test_snapshot_retries_transient_publish_rename_failure
 test_snapshot_preserves_staging_file_when_publish_retries_are_exhausted
+test_snapshot_preserves_staging_file_when_publish_copy_fails
 test_snapshot_uses_existing_mirror_when_source_missing
 test_sync_tolerates_missing_current_mirror_during_stat
 test_sync_tolerates_missing_duplicate_mirror_during_stat
