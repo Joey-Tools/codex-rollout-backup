@@ -625,6 +625,10 @@ test_snapshot_retries_transient_publish_rename_failure() {
   assert_archive_contains "$archive_path" "sessions/day/rollout-publish-retry.jsonl"
   assert_contains "$log_path" "Snapshot publish rename failed (attempt 1/2)"
   assert_contains "$state_dir/mv.log" "$archive_path"
+  if grep -Fq "$staging_dir" "$state_dir/mv.log"; then
+    printf 'Did not expect final publish rename to move directly from staging\n' >&2
+    exit 1
+  fi
   if find "$tmp_home/OneDrive/Backup/dotfiles/codex/snapshots" -name '*.tmp.*' -print | grep -q .; then
     printf 'Did not expect snapshot tmp files under OneDrive snapshots\n' >&2
     exit 1
@@ -668,6 +672,10 @@ test_snapshot_preserves_staging_file_when_publish_retries_are_exhausted() {
   assert_contains "$log_path" "Snapshot publish rename failed after 1 attempts"
   if ! find "$staging_dir" -name '*.tmp.*' -print | grep -q .; then
     printf 'Expected snapshot tmp file to remain in staging after publish failure\n' >&2
+    exit 1
+  fi
+  if find "$tmp_home/OneDrive/Backup/dotfiles/codex/snapshots" -name '*.tmp.*' -print | grep -q .; then
+    printf 'Did not expect snapshot publish tmp files to remain under OneDrive snapshots\n' >&2
     exit 1
   fi
 

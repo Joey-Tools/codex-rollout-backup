@@ -4,6 +4,7 @@ set -euo pipefail
 SNAP_DIR="${CODEX_SNAPSHOT_DIR:-$HOME/OneDrive/Backup/dotfiles/codex/snapshots}"
 LOG="$HOME/Library/Logs/codex_snapshot_daily.log"
 TMP_OUT=""
+PUBLISH_OUT=""
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MIRROR_SUPPRESSED="$(mktemp "${TMPDIR:-/tmp}/codex-snapshot-suppressed.XXXXXX")"
 
@@ -15,6 +16,21 @@ mkdir -p "$SNAP_DIR" "$(dirname "$LOG")"
 DATE="$(date +%Y-%m-%d)"
 OUT_BASE="$SNAP_DIR/codex-rollouts-$DATE.tar"
 SNAPSHOT_STAGING_DIR="${CODEX_SNAPSHOT_STAGING_DIR:-$CODEX_BACKUP_STATE_ROOT/snapshot-tmp}"
+
+copy_snapshot_to_publish_tmp() {
+  local staged_path="$1"
+  local publish_tmp="$2"
+
+  rm -f "$publish_tmp" 2>/dev/null || true
+  if cp -p "$staged_path" "$publish_tmp"; then
+    return 0
+  fi
+
+  local status=$?
+  rm -f "$publish_tmp" 2>/dev/null || true
+  echo "Snapshot publish copy failed: $staged_path -> $publish_tmp" >> "$LOG"
+  return "$status"
+}
 
 publish_snapshot() {
   local tmp_path="$1"
@@ -61,7 +77,7 @@ else
 fi
 
 TMP_LIST="$(mktemp)"
-trap 'rm -f "$TMP_LIST" "${TMP_OUT:-}" "$MIRROR_SUPPRESSED"' EXIT
+trap 'rm -f "$TMP_LIST" "${TMP_OUT:-}" "${PUBLISH_OUT:-}" "$MIRROR_SUPPRESSED"' EXIT
 
 find_codex_rollout_mirror_files | \
 while IFS= read -r -d '' file; do
@@ -83,21 +99,35 @@ mkdir -p "$SNAPSHOT_STAGING_DIR"
 if command -v zstd >/dev/null 2>&1; then
   echo "Creating zstd snapshot..." >> "$LOG"
   TMP_OUT="$SNAPSHOT_STAGING_DIR/$(basename "$OUT_BASE.zst").tmp.$$"
+  PUBLISH_OUT="$OUT_BASE.zst.tmp.$$"
   (cd "$CODEX_MIRROR_ROOT" && tar -cf - -T "$TMP_LIST") | zstd -q -T0 -f -o "$TMP_OUT"
-  if ! publish_snapshot "$TMP_OUT" "$OUT_BASE.zst"; then
+  if ! copy_snapshot_to_publish_tmp "$TMP_OUT" "$PUBLISH_OUT"; then
     TMP_OUT=""
     exit 1
   fi
+  if ! publish_snapshot "$PUBLISH_OUT" "$OUT_BASE.zst"; then
+    TMP_OUT=""
+    exit 1
+  fi
+  PUBLISH_OUT=""
+  rm -f "$TMP_OUT"
   TMP_OUT=""
   SNAP_FILE="$OUT_BASE.zst"
 else
   echo "Creating gzip snapshot..." >> "$LOG"
   TMP_OUT="$SNAPSHOT_STAGING_DIR/$(basename "$OUT_BASE.gz").tmp.$$"
+  PUBLISH_OUT="$OUT_BASE.gz.tmp.$$"
   (cd "$CODEX_MIRROR_ROOT" && tar -cf - -T "$TMP_LIST") | gzip -c > "$TMP_OUT"
-  if ! publish_snapshot "$TMP_OUT" "$OUT_BASE.gz"; then
+  if ! copy_snapshot_to_publish_tmp "$TMP_OUT" "$PUBLISH_OUT"; then
     TMP_OUT=""
     exit 1
   fi
+  if ! publish_snapshot "$PUBLISH_OUT" "$OUT_BASE.gz"; then
+    TMP_OUT=""
+    exit 1
+  fi
+  PUBLISH_OUT=""
+  rm -f "$TMP_OUT"
   TMP_OUT=""
   SNAP_FILE="$OUT_BASE.gz"
 fi
