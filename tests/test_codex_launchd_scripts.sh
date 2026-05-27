@@ -129,6 +129,88 @@ EOF
   chmod +x "$bin_dir/launchctl" "$bin_dir/plutil"
 }
 
+setup_fake_mv_once() {
+  local mv_path="$1"
+
+  mkdir -p "$(dirname "$mv_path")"
+  cat > "$mv_path" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+state_dir="${TMP_FAKE_MV_STATE:?}"
+fail_dst="${TMP_FAKE_MV_FAIL_DST:?}"
+log_file="$state_dir/mv.log"
+marker="$state_dir/failed-once"
+dst="${@: -1}"
+
+mkdir -p "$state_dir"
+printf 'mv %s\n' "$*" >> "$log_file"
+
+if [ "$dst" = "$fail_dst" ] && [ ! -e "$marker" ]; then
+  : > "$marker"
+  printf 'mv: rename %s to %s: Operation not permitted\n' "${*: -2:1}" "$dst" >&2
+  exit 1
+fi
+
+exec /bin/mv "$@"
+EOF
+  chmod +x "$mv_path"
+}
+
+setup_fake_cp_publish_failure() {
+  local cp_path="$1"
+
+  mkdir -p "$(dirname "$cp_path")"
+  cat > "$cp_path" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+state_dir="${TMP_FAKE_CP_STATE:?}"
+fail_dir="${TMP_FAKE_CP_FAIL_DIR:?}"
+log_file="$state_dir/cp.log"
+dst="${@: -1}"
+
+mkdir -p "$state_dir"
+printf 'cp %s\n' "$*" >> "$log_file"
+
+case "$dst" in
+  "$fail_dir"/codex-rollouts-*.tar.*.tmp.*)
+    printf 'partial publish tmp\n' > "$dst"
+    printf 'cp: simulated publish copy failure for %s\n' "$dst" >&2
+    exit 73
+    ;;
+esac
+
+exec /bin/cp "$@"
+EOF
+  chmod +x "$cp_path"
+}
+
+setup_fake_validating_sleep() {
+  local sleep_path="$1"
+
+  mkdir -p "$(dirname "$sleep_path")"
+  cat > "$sleep_path" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+state_dir="${TMP_FAKE_SLEEP_STATE:?}"
+log_file="$state_dir/sleep.log"
+delay="${1:-}"
+
+mkdir -p "$state_dir"
+printf 'sleep %s\n' "$delay" >> "$log_file"
+
+if [[ "$delay" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  exit 0
+fi
+
+printf 'sleep: invalid time interval %s\n' "$delay" >&2
+exit 97
+EOF
+  chmod +x "$sleep_path"
+}
+
 setup_disappear_hook() {
   local hook_path="$1"
 
@@ -251,6 +333,9 @@ test_install_generates_portable_launchd_plist() {
     PATH="$fake_bin:$PATH" \
     CODEX_SNAPSHOT_LABEL="io.github.example.codex.snapshot" \
     CODEX_SNAPSHOT_DIR="$tmp_home/Custom Snapshots" \
+    CODEX_SNAPSHOT_STAGING_DIR="$tmp_home/Custom Staging" \
+    CODEX_SNAPSHOT_PUBLISH_RENAME_ATTEMPTS=3 \
+    CODEX_SNAPSHOT_PUBLISH_RENAME_DELAY_SECONDS=0 \
     CODEX_SNAPSHOT_LEGACY_LABELS="com.example.codex.old-backup com.example.codex.old-snapshot" \
     ONEDRIVE_ROOT="$tmp_home/OneDrive Custom" \
     bash "$REPO_ROOT/scripts/codex_backup_install.sh" > "$tmp_home/install.out"
@@ -261,6 +346,9 @@ test_install_generates_portable_launchd_plist() {
   assert_contains "$plist_path" "<key>EnvironmentVariables</key>"
   assert_contains "$plist_path" "<key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>"
   assert_contains "$plist_path" "<key>CODEX_SNAPSHOT_DIR</key><string>$tmp_home/Custom Snapshots</string>"
+  assert_contains "$plist_path" "<key>CODEX_SNAPSHOT_STAGING_DIR</key><string>$tmp_home/Custom Staging</string>"
+  assert_contains "$plist_path" "<key>CODEX_SNAPSHOT_PUBLISH_RENAME_ATTEMPTS</key><string>3</string>"
+  assert_contains "$plist_path" "<key>CODEX_SNAPSHOT_PUBLISH_RENAME_DELAY_SECONDS</key><string>0</string>"
   assert_contains "$plist_path" "<key>ONEDRIVE_ROOT</key><string>$tmp_home/OneDrive Custom</string>"
   assert_contains "$plist_path" "<key>StandardOutPath</key><string>$tmp_home/Library/Logs/codex_snapshot_daily.out</string>"
   assert_not_contains "$plist_path" "com.example.codex.old"
@@ -563,6 +651,224 @@ test_snapshot_can_rerun_same_day() {
   cleanup_home "$tmp_home"
 }
 
+test_snapshot_retries_transient_publish_rename_failure() {
+  local tmp_home archive_path log_path fake_bin state_dir src_file staging_dir
+
+  tmp_home="$(new_home)"
+  archive_path="$(snapshot_archive_path "$tmp_home")"
+  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
+  fake_bin="$tmp_home/fake-bin"
+  state_dir="$tmp_home/fake-mv-state"
+  src_file="$tmp_home/.codex/sessions/day/rollout-publish-retry.jsonl"
+  staging_dir="$tmp_home/snapshot-staging"
+
+  mkdir -p "$(dirname "$src_file")"
+  setup_fake_mv_once "$fake_bin/mv"
+  printf '{"step":1}\n' > "$src_file"
+
+  HOME="$tmp_home" \
+  PATH="$fake_bin:$PATH" \
+  CODEX_SNAPSHOT_STAGING_DIR="$staging_dir" \
+  CODEX_SNAPSHOT_PUBLISH_RENAME_ATTEMPTS=2 \
+  CODEX_SNAPSHOT_PUBLISH_RENAME_DELAY_SECONDS=0 \
+  TMP_FAKE_MV_STATE="$state_dir" \
+  TMP_FAKE_MV_FAIL_DST="$archive_path" \
+  bash "$SNAPSHOT_SCRIPT"
+
+  assert_file_exists "$archive_path"
+  assert_archive_contains "$archive_path" "sessions/day/rollout-publish-retry.jsonl"
+  assert_contains "$log_path" "Snapshot publish rename failed (attempt 1/2)"
+  assert_contains "$state_dir/mv.log" "$archive_path"
+  if grep -Fq "$staging_dir" "$state_dir/mv.log"; then
+    printf 'Did not expect final publish rename to move directly from staging\n' >&2
+    exit 1
+  fi
+  if find "$tmp_home/OneDrive/Backup/dotfiles/codex/snapshots" -name '*.tmp.*' -print | grep -q .; then
+    printf 'Did not expect snapshot tmp files under OneDrive snapshots\n' >&2
+    exit 1
+  fi
+  if find "$staging_dir" -name '*.tmp.*' -print | grep -q .; then
+    printf 'Did not expect snapshot tmp files left in staging\n' >&2
+    exit 1
+  fi
+
+  cleanup_home "$tmp_home"
+}
+
+test_snapshot_allows_staging_dir_to_match_snapshot_dir() {
+  local tmp_home archive_path snapshot_dir src_file
+
+  tmp_home="$(new_home)"
+  archive_path="$(snapshot_archive_path "$tmp_home")"
+  snapshot_dir="$(dirname "$archive_path")"
+  src_file="$tmp_home/.codex/sessions/day/rollout-staging-in-snapshot-dir.jsonl"
+
+  mkdir -p "$(dirname "$src_file")"
+  printf '{"step":1}\n' > "$src_file"
+
+  HOME="$tmp_home" \
+  CODEX_SNAPSHOT_STAGING_DIR="$snapshot_dir" \
+  bash "$SNAPSHOT_SCRIPT"
+
+  assert_file_exists "$archive_path"
+  assert_archive_contains "$archive_path" "sessions/day/rollout-staging-in-snapshot-dir.jsonl"
+  if find "$snapshot_dir" -name '*.tmp.*' -print | grep -q .; then
+    printf 'Did not expect snapshot tmp files to remain when staging uses snapshot dir\n' >&2
+    exit 1
+  fi
+
+  cleanup_home "$tmp_home"
+}
+
+test_snapshot_sanitizes_invalid_publish_rename_attempts() {
+  local tmp_home archive_path err_path src_file
+
+  tmp_home="$(new_home)"
+  archive_path="$(snapshot_archive_path "$tmp_home")"
+  err_path="$tmp_home/bad-attempts.err"
+  src_file="$tmp_home/.codex/sessions/day/rollout-publish-bad-attempts.jsonl"
+
+  mkdir -p "$(dirname "$src_file")"
+  printf '{"step":1}\n' > "$src_file"
+
+  HOME="$tmp_home" \
+  CODEX_SNAPSHOT_PUBLISH_RENAME_ATTEMPTS=999999999999999999999999 \
+  bash "$SNAPSHOT_SCRIPT" 2>"$err_path"
+
+  assert_file_exists "$archive_path"
+  assert_archive_contains "$archive_path" "sessions/day/rollout-publish-bad-attempts.jsonl"
+  assert_not_contains "$err_path" "integer expression expected"
+
+  cleanup_home "$tmp_home"
+}
+
+test_snapshot_sanitizes_invalid_publish_rename_delay() {
+  local tmp_home archive_path log_path fake_bin mv_state sleep_state src_file staging_dir
+
+  tmp_home="$(new_home)"
+  archive_path="$(snapshot_archive_path "$tmp_home")"
+  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
+  fake_bin="$tmp_home/fake-bin"
+  mv_state="$tmp_home/fake-mv-state"
+  sleep_state="$tmp_home/fake-sleep-state"
+  src_file="$tmp_home/.codex/sessions/day/rollout-publish-bad-delay.jsonl"
+  staging_dir="$tmp_home/snapshot-staging"
+
+  mkdir -p "$(dirname "$src_file")"
+  setup_fake_mv_once "$fake_bin/mv"
+  setup_fake_validating_sleep "$fake_bin/sleep"
+  printf '{"step":1}\n' > "$src_file"
+
+  HOME="$tmp_home" \
+  PATH="$fake_bin:$PATH" \
+  CODEX_SNAPSHOT_STAGING_DIR="$staging_dir" \
+  CODEX_SNAPSHOT_PUBLISH_RENAME_ATTEMPTS=2 \
+  CODEX_SNAPSHOT_PUBLISH_RENAME_DELAY_SECONDS=bad \
+  TMP_FAKE_MV_STATE="$mv_state" \
+  TMP_FAKE_MV_FAIL_DST="$archive_path" \
+  TMP_FAKE_SLEEP_STATE="$sleep_state" \
+  bash "$SNAPSHOT_SCRIPT"
+
+  assert_file_exists "$archive_path"
+  assert_archive_contains "$archive_path" "sessions/day/rollout-publish-bad-delay.jsonl"
+  assert_contains "$log_path" "Snapshot publish rename failed (attempt 1/2)"
+  assert_contains "$sleep_state/sleep.log" "sleep 5"
+
+  cleanup_home "$tmp_home"
+}
+
+test_snapshot_preserves_staging_file_when_publish_retries_are_exhausted() {
+  local tmp_home archive_path log_path fake_bin state_dir src_file staging_dir
+
+  tmp_home="$(new_home)"
+  archive_path="$(snapshot_archive_path "$tmp_home")"
+  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
+  fake_bin="$tmp_home/fake-bin"
+  state_dir="$tmp_home/fake-mv-state"
+  src_file="$tmp_home/.codex/sessions/day/rollout-publish-fails.jsonl"
+  staging_dir="$tmp_home/snapshot-staging"
+
+  mkdir -p "$(dirname "$src_file")"
+  setup_fake_mv_once "$fake_bin/mv"
+  printf '{"step":1}\n' > "$src_file"
+
+  if HOME="$tmp_home" \
+    PATH="$fake_bin:$PATH" \
+    CODEX_SNAPSHOT_STAGING_DIR="$staging_dir" \
+    CODEX_SNAPSHOT_PUBLISH_RENAME_ATTEMPTS=1 \
+    CODEX_SNAPSHOT_PUBLISH_RENAME_DELAY_SECONDS=0 \
+    TMP_FAKE_MV_STATE="$state_dir" \
+    TMP_FAKE_MV_FAIL_DST="$archive_path" \
+    bash "$SNAPSHOT_SCRIPT"; then
+    printf 'Expected snapshot script to fail after exhausted publish retries\n' >&2
+    exit 1
+  fi
+
+  assert_not_exists "$archive_path"
+  assert_contains "$log_path" "Snapshot publish rename failed after 1 attempts"
+  assert_contains "$log_path" "Preserving staged snapshot for manual recovery: $staging_dir/"
+  assert_not_contains "$log_path" "leaving temp file for manual recovery"
+  if ! find "$staging_dir" -name '*.tmp.*' -print | grep -q .; then
+    printf 'Expected snapshot tmp file to remain in staging after publish failure\n' >&2
+    exit 1
+  fi
+  if find "$tmp_home/OneDrive/Backup/dotfiles/codex/snapshots" -name '*.tmp.*' -print | grep -q .; then
+    printf 'Did not expect snapshot publish tmp files to remain under OneDrive snapshots\n' >&2
+    exit 1
+  fi
+
+  cleanup_home "$tmp_home"
+}
+
+test_snapshot_preserves_staging_file_when_publish_copy_fails() {
+  local tmp_home archive_path log_path fake_bin state_dir src_file staging_dir snapshot_dir status
+
+  tmp_home="$(new_home)"
+  archive_path="$(snapshot_archive_path "$tmp_home")"
+  snapshot_dir="$(dirname "$archive_path")"
+  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
+  fake_bin="$tmp_home/fake-bin"
+  state_dir="$tmp_home/fake-cp-state"
+  src_file="$tmp_home/.codex/sessions/day/rollout-publish-copy-fails.jsonl"
+  staging_dir="$tmp_home/snapshot-staging"
+
+  mkdir -p "$(dirname "$src_file")"
+  setup_fake_cp_publish_failure "$fake_bin/cp"
+  printf '{"step":1}\n' > "$src_file"
+
+  set +e
+  HOME="$tmp_home" \
+    PATH="$fake_bin:$PATH" \
+    CODEX_SNAPSHOT_STAGING_DIR="$staging_dir" \
+    TMP_FAKE_CP_STATE="$state_dir" \
+    TMP_FAKE_CP_FAIL_DIR="$snapshot_dir" \
+    bash "$SNAPSHOT_SCRIPT"
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    printf 'Expected snapshot script to fail after publish copy failure\n' >&2
+    exit 1
+  fi
+  if [ "$status" -ne 73 ]; then
+    printf 'Expected publish copy failure exit status 73, got %s\n' "$status" >&2
+    exit 1
+  fi
+
+  assert_not_exists "$archive_path"
+  assert_contains "$log_path" "Snapshot publish copy failed"
+  assert_contains "$state_dir/cp.log" "$snapshot_dir"
+  if ! find "$staging_dir" -name '*.tmp.*' -print | grep -q .; then
+    printf 'Expected snapshot tmp file to remain in staging after publish copy failure\n' >&2
+    exit 1
+  fi
+  if find "$snapshot_dir" -name '*.tmp.*' -print | grep -q .; then
+    printf 'Did not expect snapshot publish tmp files to remain under OneDrive snapshots\n' >&2
+    exit 1
+  fi
+
+  cleanup_home "$tmp_home"
+}
+
 test_snapshot_uses_existing_mirror_when_source_missing() {
   local tmp_home archive_path mirror_file
 
@@ -736,6 +1042,12 @@ test_snapshot_skips_rolled_back_relocation_after_disappear
 test_snapshot_skips_rolled_back_relocation_after_disappear_during_mirror_sync
 test_snapshot_skips_empty_source
 test_snapshot_can_rerun_same_day
+test_snapshot_retries_transient_publish_rename_failure
+test_snapshot_allows_staging_dir_to_match_snapshot_dir
+test_snapshot_sanitizes_invalid_publish_rename_attempts
+test_snapshot_sanitizes_invalid_publish_rename_delay
+test_snapshot_preserves_staging_file_when_publish_retries_are_exhausted
+test_snapshot_preserves_staging_file_when_publish_copy_fails
 test_snapshot_uses_existing_mirror_when_source_missing
 test_sync_tolerates_missing_current_mirror_during_stat
 test_sync_tolerates_missing_duplicate_mirror_during_stat

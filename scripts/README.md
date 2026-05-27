@@ -4,7 +4,7 @@
 当前方案只保留两层数据：
 
 - 本地 `~/.dotfiles/codex-backup/mirror` mirror，优先使用 `cp --reflink=always`
-- OneDrive 上按日生成的 `snapshots/codex-rollouts-YYYY-MM-DD.tar.{zst|gz}`，写完后尝试 `/unpin` evict
+- OneDrive 上按日生成的 `snapshots/codex-rollouts-YYYY-MM-DD.tar.{zst|gz}`，归档先写到本地 staging，再重试发布到 OneDrive，写完后尝试 `/unpin` evict
 
 不再把 `sessions/` / `archived_sessions/` 逐文件发布到 OneDrive，避免额外占用一份本地云盘空间。
 
@@ -47,5 +47,6 @@ tail -n 50 ~/Library/Logs/codex_snapshot_daily.err
 
 - helper 脚本会根据自身目录动态生成 `launchd` plist；如果仓库搬到别的路径，重新运行 `./scripts/codex_backup_install.sh` 即可刷新 `ProgramArguments`。
 - snapshot 默认写到 `~/OneDrive/Backup/dotfiles/codex/snapshots`，可用 `CODEX_SNAPSHOT_DIR` 覆盖；OneDrive 根目录探测默认使用 `~/OneDrive`，可用 `ONEDRIVE_ROOT` 覆盖。mirror 默认在 `~/.dotfiles/codex-backup/mirror/`。
+- snapshot 压缩输出默认先写到 `~/.dotfiles/codex-backup/state/snapshot-tmp/`，可用 `CODEX_SNAPSHOT_STAGING_DIR` 覆盖。发布到 OneDrive 的最终 rename 默认重试 12 次、每次间隔 5 秒，可用 `CODEX_SNAPSHOT_PUBLISH_RENAME_ATTEMPTS` 和 `CODEX_SNAPSHOT_PUBLISH_RENAME_DELAY_SECONDS` 覆盖。
 - 通过 installer 环境传入的 snapshot、mirror 和 OneDrive 覆盖项会写入生成的 `launchd` plist；生成的 job 默认包含 Homebrew-friendly `PATH`，也可用 `CODEX_SNAPSHOT_PATH` 覆盖。修改这些覆盖项后需要重新运行 installer。
 - 需要清理旧 job 时，用 `CODEX_SNAPSHOT_LEGACY_LABELS` 传入空格分隔的 legacy launchd labels；公开 installer 默认不硬编码个人旧 label。

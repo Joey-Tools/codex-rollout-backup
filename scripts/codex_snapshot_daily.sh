@@ -4,6 +4,7 @@ set -euo pipefail
 SNAP_DIR="${CODEX_SNAPSHOT_DIR:-$HOME/OneDrive/Backup/dotfiles/codex/snapshots}"
 LOG="$HOME/Library/Logs/codex_snapshot_daily.log"
 TMP_OUT=""
+PUBLISH_OUT=""
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MIRROR_SUPPRESSED="$(mktemp "${TMPDIR:-/tmp}/codex-snapshot-suppressed.XXXXXX")"
 
@@ -14,6 +15,69 @@ mkdir -p "$SNAP_DIR" "$(dirname "$LOG")"
 . "$SCRIPT_DIR/onedrive_unpin_common.sh"
 DATE="$(date +%Y-%m-%d)"
 OUT_BASE="$SNAP_DIR/codex-rollouts-$DATE.tar"
+SNAPSHOT_STAGING_DIR="${CODEX_SNAPSHOT_STAGING_DIR:-$CODEX_BACKUP_STATE_ROOT/snapshot-tmp}"
+
+copy_snapshot_to_publish_tmp() {
+  local staged_path="$1"
+  local publish_tmp="$2"
+
+  rm -f "$publish_tmp" 2>/dev/null || true
+  if cp -p "$staged_path" "$publish_tmp"; then
+    return 0
+  else
+    local status=$?
+  fi
+
+  rm -f "$publish_tmp" 2>/dev/null || true
+  echo "Snapshot publish copy failed: $staged_path -> $publish_tmp" >> "$LOG"
+  return "$status"
+}
+
+preserve_staged_snapshot_for_recovery() {
+  local staged_path="$1"
+
+  [ -n "$staged_path" ] || return 0
+  echo "Preserving staged snapshot for manual recovery: $staged_path" >> "$LOG"
+}
+
+publish_snapshot() {
+  local tmp_path="$1"
+  local final_path="$2"
+  local attempts="${CODEX_SNAPSHOT_PUBLISH_RENAME_ATTEMPTS:-12}"
+  local delay_seconds="${CODEX_SNAPSHOT_PUBLISH_RENAME_DELAY_SECONDS:-5}"
+  local attempt=1
+  local status=1
+
+  if ! [[ "$attempts" =~ ^[0-9]+$ ]] || [ "${#attempts}" -gt 4 ] || [ "$attempts" -lt 1 ]; then
+    attempts=1
+  fi
+  if ! [[ "$delay_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    delay_seconds=5
+  fi
+
+  while [ "$attempt" -le "$attempts" ]; do
+    if mv -f "$tmp_path" "$final_path"; then
+      return 0
+    else
+      status=$?
+    fi
+
+    if [ ! -e "$tmp_path" ]; then
+      echo "Snapshot publish failed and temp file is missing: $tmp_path -> $final_path" >> "$LOG"
+      return "$status"
+    fi
+
+    if [ "$attempt" -lt "$attempts" ]; then
+      echo "Snapshot publish rename failed (attempt $attempt/$attempts): $tmp_path -> $final_path; retrying in ${delay_seconds}s" >> "$LOG"
+      sleep "$delay_seconds"
+    fi
+
+    attempt=$((attempt + 1))
+  done
+
+  echo "Snapshot publish rename failed after $attempts attempts: $tmp_path -> $final_path" >> "$LOG"
+  return "$status"
+}
 
 echo "==== $(date) ====" >> "$LOG"
 
@@ -24,7 +88,7 @@ else
 fi
 
 TMP_LIST="$(mktemp)"
-trap 'rm -f "$TMP_LIST" "${TMP_OUT:-}" "$MIRROR_SUPPRESSED"' EXIT
+trap 'rm -f "$TMP_LIST" "${TMP_OUT:-}" "${PUBLISH_OUT:-}" "$MIRROR_SUPPRESSED"' EXIT
 
 find_codex_rollout_mirror_files | \
 while IFS= read -r -d '' file; do
@@ -41,18 +105,56 @@ if [ ! -s "$TMP_LIST" ]; then
   exit 0
 fi
 
+mkdir -p "$SNAPSHOT_STAGING_DIR"
+
 if command -v zstd >/dev/null 2>&1; then
   echo "Creating zstd snapshot..." >> "$LOG"
-  TMP_OUT="$OUT_BASE.zst.tmp.$$"
+  TMP_OUT="$SNAPSHOT_STAGING_DIR/$(basename "$OUT_BASE.zst").tmp.$$"
+  PUBLISH_OUT="$OUT_BASE.zst.publish.tmp.$$"
   (cd "$CODEX_MIRROR_ROOT" && tar -cf - -T "$TMP_LIST") | zstd -q -T0 -f -o "$TMP_OUT"
-  mv "$TMP_OUT" "$OUT_BASE.zst"
+  if copy_snapshot_to_publish_tmp "$TMP_OUT" "$PUBLISH_OUT"; then
+    :
+  else
+    snapshot_status=$?
+    preserve_staged_snapshot_for_recovery "$TMP_OUT"
+    TMP_OUT=""
+    exit "$snapshot_status"
+  fi
+  if publish_snapshot "$PUBLISH_OUT" "$OUT_BASE.zst"; then
+    :
+  else
+    snapshot_status=$?
+    preserve_staged_snapshot_for_recovery "$TMP_OUT"
+    TMP_OUT=""
+    exit "$snapshot_status"
+  fi
+  PUBLISH_OUT=""
+  rm -f "$TMP_OUT"
   TMP_OUT=""
   SNAP_FILE="$OUT_BASE.zst"
 else
   echo "Creating gzip snapshot..." >> "$LOG"
-  TMP_OUT="$OUT_BASE.gz.tmp.$$"
+  TMP_OUT="$SNAPSHOT_STAGING_DIR/$(basename "$OUT_BASE.gz").tmp.$$"
+  PUBLISH_OUT="$OUT_BASE.gz.publish.tmp.$$"
   (cd "$CODEX_MIRROR_ROOT" && tar -cf - -T "$TMP_LIST") | gzip -c > "$TMP_OUT"
-  mv "$TMP_OUT" "$OUT_BASE.gz"
+  if copy_snapshot_to_publish_tmp "$TMP_OUT" "$PUBLISH_OUT"; then
+    :
+  else
+    snapshot_status=$?
+    preserve_staged_snapshot_for_recovery "$TMP_OUT"
+    TMP_OUT=""
+    exit "$snapshot_status"
+  fi
+  if publish_snapshot "$PUBLISH_OUT" "$OUT_BASE.gz"; then
+    :
+  else
+    snapshot_status=$?
+    preserve_staged_snapshot_for_recovery "$TMP_OUT"
+    TMP_OUT=""
+    exit "$snapshot_status"
+  fi
+  PUBLISH_OUT=""
+  rm -f "$TMP_OUT"
   TMP_OUT=""
   SNAP_FILE="$OUT_BASE.gz"
 fi
