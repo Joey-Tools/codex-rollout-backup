@@ -64,7 +64,8 @@ def without_checkout_target_binding(workflow: str) -> str:
         "      - uses: actions/checkout@v4\n"
         "        with:\n"
         "          repository: ${{ inputs.repository }}\n"
-        "          ref: ${{ inputs.ref }}\n",
+        "          ref: ${{ inputs.ref }}\n"
+        "          persist-credentials: false\n",
         "      - uses: actions/checkout@v4\n",
     )
 
@@ -117,7 +118,8 @@ class RequiredCiWorkflowTests(unittest.TestCase):
             self.assertIn(
                 "        with:\n"
                 "          repository: ${{ inputs.repository }}\n"
-                "          ref: ${{ inputs.ref }}",
+                "          ref: ${{ inputs.ref }}\n"
+                "          persist-credentials: false",
                 checkout_step,
             )
 
