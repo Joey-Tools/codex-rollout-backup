@@ -63,8 +63,8 @@ def without_checkout_target_binding(workflow: str) -> str:
     return workflow.replace(
         "      - uses: actions/checkout@v4\n"
         "        with:\n"
-        "          repository: ${{ inputs.repository }}\n"
-        "          ref: ${{ inputs.ref }}\n"
+        "          repository: ${{ github.repository }}\n"
+        "          ref: ${{ github.sha }}\n"
         "          persist-credentials: false\n",
         "      - uses: actions/checkout@v4\n",
     )
@@ -76,14 +76,7 @@ class RequiredCiWorkflowTests(unittest.TestCase):
 
         self.assertEqual(
             workflow_call_block(workflow),
-            "  workflow_call:\n"
-            "    inputs:\n"
-            "      repository:\n"
-            "        required: true\n"
-            "        type: string\n"
-            "      ref:\n"
-            "        required: true\n"
-            "        type: string",
+            "  workflow_call:",
         )
         self.assertIn("permissions:\n  contents: read\n", workflow)
         self.assertEqual(top_level_job_ids(workflow), ["test"])
@@ -109,7 +102,7 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, workflow)
 
-    def test_every_checkout_binds_the_requested_repository_and_ref(self) -> None:
+    def test_every_checkout_binds_the_triggering_repository_and_sha(self) -> None:
         workflow = REQUIRED_WORKFLOW_PATH.read_text(encoding="utf-8")
         checkout_steps = checkout_step_blocks(workflow)
 
@@ -117,11 +110,13 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         for checkout_step in checkout_steps:
             self.assertIn(
                 "        with:\n"
-                "          repository: ${{ inputs.repository }}\n"
-                "          ref: ${{ inputs.ref }}\n"
+                "          repository: ${{ github.repository }}\n"
+                "          ref: ${{ github.sha }}\n"
                 "          persist-credentials: false",
                 checkout_step,
             )
+        self.assertNotIn("inputs.repository", workflow)
+        self.assertNotIn("inputs.ref", workflow)
 
     def test_existing_and_reusable_workflows_share_the_required_job(self) -> None:
         ci_workflow = CI_WORKFLOW_PATH.read_text(encoding="utf-8")

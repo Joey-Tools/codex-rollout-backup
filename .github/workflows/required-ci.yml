@@ -2,13 +2,6 @@ name: Required CI
 
 on:
   workflow_call:
-    inputs:
-      repository:
-        required: true
-        type: string
-      ref:
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -19,8 +12,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.repository }}
-          ref: ${{ inputs.ref }}
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
