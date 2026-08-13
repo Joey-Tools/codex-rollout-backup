@@ -5,6 +5,12 @@ import unittest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW_PATH = REPO_ROOT / ".github/workflows/ci.yml"
 REQUIRED_WORKFLOW_PATH = REPO_ROOT / ".github/workflows/required-ci.yml"
+EXPECTED_REPOSITORY = "Joey-Tools/codex-rollout-backup"
+REPOSITORY_GUARD = (
+    "      - name: Reject unexpected repository\n"
+    f"        if: ${{{{ github.repository != '{EXPECTED_REPOSITORY}' }}}}\n"
+    "        run: exit 1"
+)
 
 
 def top_level_job_ids(workflow: str) -> list[str]:
@@ -61,9 +67,11 @@ def checkout_step_blocks(workflow: str) -> list[str]:
 
 def without_checkout_target_binding(workflow: str) -> str:
     return workflow.replace(
+        REPOSITORY_GUARD
+        + "\n"
         "      - uses: actions/checkout@v4\n"
         "        with:\n"
-        "          repository: ${{ github.repository }}\n"
+        f"          repository: {EXPECTED_REPOSITORY}\n"
         "          ref: ${{ github.sha }}\n"
         "          persist-credentials: false\n",
         "      - uses: actions/checkout@v4\n",
@@ -102,19 +110,34 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, workflow)
 
-    def test_every_checkout_binds_the_triggering_repository_and_sha(self) -> None:
+    def test_every_checkout_binds_the_exact_repository_and_triggering_sha(self) -> None:
         workflow = REQUIRED_WORKFLOW_PATH.read_text(encoding="utf-8")
         checkout_steps = checkout_step_blocks(workflow)
 
         self.assertGreater(len(checkout_steps), 0)
+        self.assertEqual(
+            workflow.count(
+                REPOSITORY_GUARD + "\n      - uses: actions/checkout@"
+            ),
+            len(checkout_steps),
+        )
+        self.assertEqual(
+            workflow.count(f"repository: {EXPECTED_REPOSITORY}"),
+            len(checkout_steps),
+        )
+        self.assertEqual(workflow.count("ref: ${{ github.sha }}"), len(checkout_steps))
+        self.assertEqual(
+            workflow.count("persist-credentials: false"), len(checkout_steps)
+        )
         for checkout_step in checkout_steps:
             self.assertIn(
                 "        with:\n"
-                "          repository: ${{ github.repository }}\n"
+                f"          repository: {EXPECTED_REPOSITORY}\n"
                 "          ref: ${{ github.sha }}\n"
                 "          persist-credentials: false",
                 checkout_step,
             )
+        self.assertNotIn("repository: ${{ github.repository }}", workflow)
         self.assertNotIn("inputs.repository", workflow)
         self.assertNotIn("inputs.ref", workflow)
 

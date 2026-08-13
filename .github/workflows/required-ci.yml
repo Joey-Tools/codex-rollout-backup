@@ -10,9 +10,12 @@ jobs:
   test:
     runs-on: macos-latest
     steps:
+      - name: Reject unexpected repository
+        if: ${{ github.repository != 'Joey-Tools/codex-rollout-backup' }}
+        run: exit 1
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository }}
+          repository: Joey-Tools/codex-rollout-backup
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
