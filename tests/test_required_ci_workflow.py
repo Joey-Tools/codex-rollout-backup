@@ -30,11 +30,60 @@ def jobs_block(workflow: str) -> str:
     return workflow[workflow.index("jobs:\n") :]
 
 
+def workflow_call_block(workflow: str) -> str:
+    lines = workflow.splitlines()
+    start = lines.index("  workflow_call:")
+    end = start + 1
+    while end < len(lines) and (not lines[end] or lines[end].startswith("    ")):
+        end += 1
+    return "\n".join(lines[start:end]).rstrip("\n")
+
+
+def checkout_step_blocks(workflow: str) -> list[str]:
+    lines = workflow.splitlines()
+    blocks: list[str] = []
+    for start, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not stripped.startswith("- uses: actions/checkout@"):
+            continue
+        step_indent = len(line) - len(stripped)
+        end = start + 1
+        while end < len(lines):
+            candidate = lines[end]
+            candidate_stripped = candidate.lstrip()
+            candidate_indent = len(candidate) - len(candidate_stripped)
+            if candidate_stripped and candidate_indent <= step_indent:
+                break
+            end += 1
+        blocks.append("\n".join(lines[start:end]))
+    return blocks
+
+
+def without_checkout_target_binding(workflow: str) -> str:
+    return workflow.replace(
+        "      - uses: actions/checkout@v4\n"
+        "        with:\n"
+        "          repository: ${{ inputs.repository }}\n"
+        "          ref: ${{ inputs.ref }}\n",
+        "      - uses: actions/checkout@v4\n",
+    )
+
+
 class RequiredCiWorkflowTests(unittest.TestCase):
     def test_entry_wraps_only_the_required_macos_test(self) -> None:
         workflow = REQUIRED_WORKFLOW_PATH.read_text(encoding="utf-8")
 
-        self.assertIn("on:\n  workflow_call:\n", workflow)
+        self.assertEqual(
+            workflow_call_block(workflow),
+            "  workflow_call:\n"
+            "    inputs:\n"
+            "      repository:\n"
+            "        required: true\n"
+            "        type: string\n"
+            "      ref:\n"
+            "        required: true\n"
+            "        type: string",
+        )
         self.assertIn("permissions:\n  contents: read\n", workflow)
         self.assertEqual(top_level_job_ids(workflow), ["test"])
         self.assertIn("runs-on: macos-latest", workflow)
@@ -59,12 +108,28 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, workflow)
 
+    def test_every_checkout_binds_the_requested_repository_and_ref(self) -> None:
+        workflow = REQUIRED_WORKFLOW_PATH.read_text(encoding="utf-8")
+        checkout_steps = checkout_step_blocks(workflow)
+
+        self.assertGreater(len(checkout_steps), 0)
+        for checkout_step in checkout_steps:
+            self.assertIn(
+                "        with:\n"
+                "          repository: ${{ inputs.repository }}\n"
+                "          ref: ${{ inputs.ref }}",
+                checkout_step,
+            )
+
     def test_existing_and_reusable_workflows_share_the_required_job(self) -> None:
         ci_workflow = CI_WORKFLOW_PATH.read_text(encoding="utf-8")
         required_workflow = REQUIRED_WORKFLOW_PATH.read_text(encoding="utf-8")
 
         self.assertEqual(top_level_job_ids(ci_workflow), ["test"])
-        self.assertEqual(jobs_block(ci_workflow), jobs_block(required_workflow))
+        self.assertEqual(
+            jobs_block(ci_workflow),
+            jobs_block(without_checkout_target_binding(required_workflow)),
+        )
         self.assertIn(
             "python3 -B tests/test_required_ci_workflow.py",
             jobs_block(ci_workflow),
