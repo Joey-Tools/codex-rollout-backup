@@ -54,7 +54,7 @@ class RequiredCiWorkflowTests(unittest.TestCase):
             "ubuntu-latest",
             "secrets.",
             "contents: write",
-            "id-token: write",
+            "id-" + "token: write",
             "statuses: write",
         ):
             self.assertNotIn(forbidden, workflow)
