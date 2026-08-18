@@ -17,10 +17,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: "3.9"
       - name: Shell syntax
         run: |
           bash -n scripts/*.sh tests/test_codex_launchd_scripts.sh
       - name: Run smoke tests
         run: |
           bash tests/test_codex_launchd_scripts.sh
+      - name: Compile reflink repair utility
+        run: |
+          python -m py_compile scripts/codex_reflink_darwin.py scripts/codex_repair_rollout_reflinks.py scripts/codex_rollout_mirror_copy.py scripts/codex_snapshot_lock.py tests/test_codex_repair_rollout_reflinks.py tests/test_codex_rollout_mirror_copy.py
+      - name: Run reflink repair tests
+        run: |
+          python -m unittest discover -s tests -p 'test_codex_repair_rollout_reflinks.py' -v
+      - name: Run rollout mirror copy tests
+        run: |
+          python -m unittest discover -s tests -p 'test_codex_rollout_mirror_copy.py' -v
