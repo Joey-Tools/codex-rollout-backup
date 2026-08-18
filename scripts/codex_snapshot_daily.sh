@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+# Keep the canonical scheduled checkout free of Python bytecode from this process tree.
+export PYTHONDONTWRITEBYTECODE=1
+
 SNAP_DIR="${CODEX_SNAPSHOT_DIR:-$HOME/OneDrive/Backup/dotfiles/codex/snapshots}"
 LOG="$HOME/Library/Logs/codex_snapshot_daily.log"
 TMP_LIST=""
