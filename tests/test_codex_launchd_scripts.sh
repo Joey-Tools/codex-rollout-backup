@@ -305,6 +305,41 @@ EOF
   chmod +x "$python_path"
 }
 
+setup_bytecode_guard_python3() {
+  local python_path="$1"
+
+  mkdir -p "$(dirname "$python_path")"
+  cat > "$python_path" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+state_dir="${TMP_BYTECODE_GUARD_STATE:?}"
+bytecode_setting="${PYTHONDONTWRITEBYTECODE-<unset>}"
+
+mkdir -p "$state_dir"
+printf 'PYTHONDONTWRITEBYTECODE=%s %s\n' "$bytecode_setting" "$*" >> "$state_dir/python3.log"
+if [ "$bytecode_setting" != "1" ]; then
+  printf 'Expected PYTHONDONTWRITEBYTECODE=1, got: %s\n' "$bytecode_setting" >&2
+  exit 97
+fi
+
+case "${1:-}" in
+  */codex_snapshot_lock.py)
+    exit 0
+    ;;
+  */codex_repair_rollout_reflinks.py)
+    printf '{"command":"%s","status":0}\n' "${2:-}"
+    exit 0
+    ;;
+  *)
+    printf 'Unexpected Python child: %s\n' "$*" >&2
+    exit 98
+    ;;
+esac
+EOF
+  chmod +x "$python_path"
+}
+
 setup_fake_mirror_copy_helper() {
   local helper_path="$1"
 
@@ -818,6 +853,57 @@ test_snapshot_skips_missing_source() {
   assert_file_exists "$log_path"
   assert_contains "$log_path" "Source rollout directories missing, snapshotting existing mirror"
   assert_contains "$log_path" "No mirrored rollout files found, skipping snapshot."
+  cleanup_home "$tmp_home"
+}
+
+test_snapshot_disables_bytecode_writes_for_python_children() {
+  local tmp_home fake_bin state_dir status
+
+  tmp_home="$(new_home)"
+  fake_bin="$tmp_home/fake-bin"
+  state_dir="$tmp_home/bytecode-guard-state"
+  setup_bytecode_guard_python3 "$fake_bin/python3"
+
+  set +e
+  HOME="$tmp_home" \
+    PATH="$fake_bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=0 \
+    TMP_BYTECODE_GUARD_STATE="$state_dir" \
+    bash "$SNAPSHOT_SCRIPT" > "$tmp_home/snapshot.out" 2> "$tmp_home/snapshot.err"
+  status=$?
+  set -e
+
+  if [ "$status" -ne 0 ]; then
+    cat "$tmp_home/snapshot.err" >&2
+    cleanup_home "$tmp_home"
+    return "$status"
+  fi
+
+  set +e
+  HOME="$tmp_home" \
+    PATH="$fake_bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=0 \
+    TMP_BYTECODE_GUARD_STATE="$state_dir" \
+    bash "$SNAPSHOT_SCRIPT" --snapshot-lock-held \
+      >> "$tmp_home/snapshot.out" 2>> "$tmp_home/snapshot.err"
+  status=$?
+  set -e
+
+  if [ "$status" -ne 0 ]; then
+    cat "$tmp_home/snapshot.err" >&2
+    cleanup_home "$tmp_home"
+    return "$status"
+  fi
+
+  assert_contains "$state_dir/python3.log" \
+    "PYTHONDONTWRITEBYTECODE=1 $SNAPSHOT_LOCK_HELPER acquire"
+  assert_contains "$state_dir/python3.log" \
+    "PYTHONDONTWRITEBYTECODE=1 $SNAPSHOT_LOCK_HELPER verify"
+  assert_contains "$state_dir/python3.log" \
+    "PYTHONDONTWRITEBYTECODE=1 $REPO_ROOT/scripts/codex_repair_rollout_reflinks.py recover"
+  assert_contains "$state_dir/python3.log" \
+    "PYTHONDONTWRITEBYTECODE=1 $REPO_ROOT/scripts/codex_repair_rollout_reflinks.py retry"
+
   cleanup_home "$tmp_home"
 }
 
@@ -2945,7 +3031,24 @@ test_snapshot_handles_many_relocations_under_low_maxfiles() {
   cleanup_home "$tmp_home"
 }
 
+if [ -n "${CODEX_LAUNCHD_TEST_SELECTOR:-}" ]; then
+  case "$CODEX_LAUNCHD_TEST_SELECTOR" in
+    test_*) ;;
+    *)
+      printf 'Invalid test selector: %s\n' "$CODEX_LAUNCHD_TEST_SELECTOR" >&2
+      exit 2
+      ;;
+  esac
+  if ! declare -F "$CODEX_LAUNCHD_TEST_SELECTOR" >/dev/null; then
+    printf 'Unknown test selector: %s\n' "$CODEX_LAUNCHD_TEST_SELECTOR" >&2
+    exit 2
+  fi
+  "$CODEX_LAUNCHD_TEST_SELECTOR"
+  exit 0
+fi
+
 test_snapshot_skips_missing_source
+test_snapshot_disables_bytecode_writes_for_python_children
 test_snapshot_updates_mirror_and_archive_from_complete_lines
 test_snapshot_runs_recover_sync_retry_before_publish
 test_snapshot_stops_and_cleans_temps_when_reflink_retry_is_fatal
