@@ -3,7 +3,7 @@ id: 20260918-c3e107
 title: Review Gate v2 Handoff
 status: completed
 created: 2026-09-18
-updated: 2026-09-29
+updated: 2026-09-30
 branch: codex/daily-skill-friction-2026-09-29-codex-rollout-backup-remove-v1-bridge
 pr:
 supersedes: []
@@ -19,7 +19,7 @@ superseded_by:
 ## Current State
 - Pull requests use the `codex/github-review-gate` check; the temporary `codex/review-gate` status producer has been removed.
 - The verifier and controller use the owner-approved floating `JoeyTeng/codex-review-gate-action@v2` selector and the canonical `any` request-author policy.
-- The controller responds to new provider comments; manual reconcile remains available for edited comments.
+- The controller responds to new provider comments; manual reconcile remains available for edited comments. When `CODEX_REVIEW_GATE_AUTO_REQUEST=true`, it also handles a verifier's first failed `pull_request` run to request review for that run's PR and head. The variable remains unset, so automatic requests are off by default.
 - This repository change does not modify the organization ruleset.
 
 ## Next Steps
