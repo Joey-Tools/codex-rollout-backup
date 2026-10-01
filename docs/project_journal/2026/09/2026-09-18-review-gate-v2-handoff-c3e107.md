@@ -3,7 +3,7 @@ id: 20260918-c3e107
 title: Review Gate v2 Handoff
 status: completed
 created: 2026-09-18
-updated: 2026-09-29
+updated: 2026-10-01
 branch: codex/daily-skill-friction-2026-09-29-codex-rollout-backup-remove-v1-bridge
 pr:
 supersedes: []
@@ -19,6 +19,7 @@ superseded_by:
 ## Current State
 - Pull requests use the `codex/github-review-gate` check; the temporary `codex/review-gate` status producer has been removed.
 - The verifier and controller use the owner-approved floating `JoeyTeng/codex-review-gate-action@v2` selector and the canonical `any` request-author policy.
+- The verifier grants read-only Actions access for review-evidence reconciliation.
 - The controller responds to new provider comments; manual reconcile remains available for edited comments.
 - This repository change does not modify the organization ruleset.
 
