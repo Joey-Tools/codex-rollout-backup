@@ -21,6 +21,7 @@ superseded_by:
 - The verifier and controller use the owner-approved floating `JoeyTeng/codex-review-gate-action@v2` selector and the canonical `any` request-author policy.
 - The verifier grants read-only Actions access for review-evidence reconciliation.
 - The controller responds to new provider comments; manual reconcile remains available for edited comments.
+- When `CODEX_REVIEW_GATE_AUTO_REQUEST=true`, a failed first verifier run can start a fresh review for its single associated PR, using the run's `head_sha` as the expected head.
 - This repository change does not modify the organization ruleset.
 
 ## Next Steps
