@@ -10,8 +10,10 @@ import sys
 
 
 INVALID_CHARACTERS = set('/\\:*?"<>|')
-RESERVED_NAMES = {".lock", "desktop.ini", "con", "prn", "aux", "nul"}
-RESERVED_DEVICE_NAME = re.compile(r"^(?:com[0-9]|lpt[0-9])(?:\..*)?$", re.IGNORECASE)
+RESERVED_NAMES = {".lock", "desktop.ini"}
+RESERVED_DEVICE_NAME = re.compile(
+    r"^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\..*)?$", re.IGNORECASE
+)
 
 
 def read_computer_name() -> str:

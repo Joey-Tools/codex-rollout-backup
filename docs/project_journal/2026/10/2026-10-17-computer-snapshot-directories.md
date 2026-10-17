@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-17
 updated: 2026-10-17
 branch: wip/computer-snapshots
-pr:
+pr: https://github.com/Joey-Tools/codex-rollout-backup/pull/22
 supersedes: []
 superseded_by:
 ---
@@ -24,11 +24,12 @@ superseded_by:
 - Reject missing or unsupported names before creating a snapshot directory; do not silently combine distinct names through sanitization or a shared fallback.
 - Keep the local rollout mirror, repair state, and snapshot lock locations unchanged.
 - Retain the existing daily 02:00 schedule.
+- Reject Windows device basenames even when followed by an extension, including `CON.txt`, `PRN.backup`, `AUX.1`, and `NUL.log`, without rejecting normal names that merely contain those strings.
 
 ## Validation
 
 - Python 3.12.12: all 416 repair and mirror-copy tests passed.
-- The complete shell suite passed all 46 top-level cases, including runtime computer-name changes, separate same-day archives, explicit destination compatibility, invalid-name rejection, and installer environment propagation.
+- The complete shell suite passed all 47 top-level cases, including runtime computer-name changes, separate same-day archives, explicit destination compatibility, invalid-name rejection, accepted device-name substrings, and installer environment propagation.
 - All shell files passed individual `bash -n` checks; Python sources and tests passed compilation; project-journal validation and whitespace checks passed.
 - ShellCheck was unavailable locally; syntax checks and the full shell suite supplied the executed fallback validation.
 - The migration audit reproduced a native `os.dup2(..., inheritable=False)` crash in the unchanged baseline under the host's system Python 3.9.6. The independently installed Python 3.12.12 passed that case and the complete suite; the host backup installation selects that runtime through its existing `CODEX_SNAPSHOT_PATH` setting.

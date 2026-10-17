@@ -2614,7 +2614,7 @@ EOF
 
 test_snapshot_fails_closed_without_valid_computer_name() {
   local tmp_home fake_bin status invalid_name
-  local invalid_names=("Bad/Name" 'Bad\Name' '..' 'Bad:' 'Bad*Name' 'Bad?Name' 'Bad"Name' 'Bad<Name' 'Bad>Name' 'Bad|Name' 'Trailing.' 'Trailing ' ' Leading' '.lock' 'CON' 'PRN' 'AUX' 'NUL' 'COM0' 'COM9' 'LPT0' 'LPT9' 'desktop.ini' '~$lock' 'Mac_vti_Name' $'Bad\nName')
+  local invalid_names=("Bad/Name" 'Bad\Name' '..' 'Bad:' 'Bad*Name' 'Bad?Name' 'Bad"Name' 'Bad<Name' 'Bad>Name' 'Bad|Name' 'Trailing.' 'Trailing ' ' Leading' '.lock' 'CON' 'PRN' 'AUX' 'NUL' 'CON.txt' 'PRN.backup' 'AUX.1' 'NUL.log' 'cOn.TXT' 'pRn.Backup' 'aUx.1' 'nUl.log' 'COM0' 'COM9' 'LPT0' 'LPT9' 'desktop.ini' '~$lock' 'Mac_vti_Name' $'Bad\nName')
 
   tmp_home="$(new_home)"
   fake_bin="$tmp_home/fake-bin"
@@ -2651,6 +2651,22 @@ EOF
     assert_not_exists "$tmp_home/OneDrive/Backup/dotfiles/codex"
   done
 
+  cleanup_home "$tmp_home"
+}
+
+test_snapshot_accepts_computer_name_containing_reserved_name_substring() {
+  local tmp_home snapshot_dir
+
+  tmp_home="$(new_home)"
+  snapshot_dir="$tmp_home/OneDrive/Backup/dotfiles/codex/Mac mini construction/snapshots"
+
+  HOME="$tmp_home" CODEX_BACKUP_COMPUTER_NAME="Mac mini construction" bash "$SNAPSHOT_SCRIPT"
+
+  assert_file_exists "$tmp_home/Library/Logs/codex_snapshot_daily.log"
+  if [ ! -d "$snapshot_dir" ]; then
+    printf 'Expected normal computer name to resolve without rewriting: %s\n' "$snapshot_dir" >&2
+    exit 1
+  fi
   cleanup_home "$tmp_home"
 }
 
@@ -3193,6 +3209,7 @@ test_snapshot_can_rerun_same_day
 test_snapshot_default_paths_follow_runtime_computer_name
 test_snapshot_explicit_directory_does_not_require_computer_name
 test_snapshot_fails_closed_without_valid_computer_name
+test_snapshot_accepts_computer_name_containing_reserved_name_substring
 test_snapshot_retries_transient_publish_rename_failure
 test_snapshot_allows_staging_dir_to_match_snapshot_dir
 test_snapshot_sanitizes_invalid_publish_rename_attempts
