@@ -4,6 +4,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SNAPSHOT_SCRIPT="$REPO_ROOT/scripts/codex_snapshot_daily.sh"
 SNAPSHOT_LOCK_HELPER="$REPO_ROOT/scripts/codex_snapshot_lock.py"
+TEST_DEFAULT_COMPUTER_NAME="${CODEX_BACKUP_COMPUTER_NAME:-Codex Test Computer}"
+export CODEX_BACKUP_COMPUTER_NAME="$TEST_DEFAULT_COMPUTER_NAME"
 
 assert_file_exists() {
   local path="$1"
@@ -273,7 +275,7 @@ real_python="${TMP_REAL_PYTHON3:-/usr/bin/python3}"
 order_log="${TMP_FAKE_REFLINK_ORDER_LOG:-}"
 
 case "${1:-}" in
-  */codex_snapshot_lock.py|*/codex_rollout_mirror_copy.py)
+  */codex_snapshot_lock.py|*/codex_snapshot_path.py|*/codex_rollout_mirror_copy.py)
     exec "$real_python" "$@"
     ;;
 esac
@@ -326,6 +328,9 @@ fi
 case "${1:-}" in
   */codex_snapshot_lock.py)
     exit 0
+    ;;
+  */codex_snapshot_path.py)
+    exec "${TMP_REAL_PYTHON3:-/usr/bin/python3}" "$@"
     ;;
   */codex_repair_rollout_reflinks.py)
     printf '{"command":"%s","status":0}\n' "${2:-}"
@@ -720,9 +725,10 @@ run_mirror_sync_without_log_in_isolated_shell() (
 
 snapshot_archive_path() {
   local tmp_home="$1"
+  local computer_name="${2:-$TEST_DEFAULT_COMPUTER_NAME}"
   local base_path
 
-  base_path="$tmp_home/OneDrive/Backup/dotfiles/codex/snapshots/codex-rollouts-$(date +%Y-%m-%d).tar"
+  base_path="$tmp_home/OneDrive/Backup/dotfiles/codex/$computer_name/snapshots/codex-rollouts-$(date +%Y-%m-%d).tar"
   if command -v zstd >/dev/null 2>&1; then
     printf '%s.zst\n' "$base_path"
   else
@@ -732,9 +738,10 @@ snapshot_archive_path() {
 
 resolved_snapshot_archive_path() {
   local tmp_home="$1"
+  local computer_name="${2:-$TEST_DEFAULT_COMPUTER_NAME}"
   local base_path
 
-  base_path="$tmp_home/Library/CloudStorage/OneDrive/Backup/dotfiles/codex/snapshots/codex-rollouts-$(date +%Y-%m-%d).tar"
+  base_path="$tmp_home/Library/CloudStorage/OneDrive/Backup/dotfiles/codex/$computer_name/snapshots/codex-rollouts-$(date +%Y-%m-%d).tar"
   if command -v zstd >/dev/null 2>&1; then
     printf '%s.zst\n' "$base_path"
   else
@@ -813,6 +820,7 @@ test_install_generates_portable_launchd_plist() {
   HOME="$tmp_home" \
     PATH="$fake_bin:$PATH" \
     CODEX_SNAPSHOT_LABEL="io.github.example.codex.snapshot" \
+    CODEX_BACKUP_COMPUTER_NAME="Office & Studio" \
     CODEX_SNAPSHOT_DIR="$tmp_home/Custom Snapshots" \
     CODEX_SNAPSHOT_STAGING_DIR="$tmp_home/Custom Staging" \
     CODEX_SNAPSHOT_PUBLISH_RENAME_ATTEMPTS=3 \
@@ -825,6 +833,7 @@ test_install_generates_portable_launchd_plist() {
   assert_contains "$plist_path" "<key>Label</key><string>io.github.example.codex.snapshot</string>"
   assert_contains "$plist_path" "<string>$REPO_ROOT/scripts/codex_snapshot_daily.sh</string>"
   assert_contains "$plist_path" "<key>EnvironmentVariables</key>"
+  assert_contains "$plist_path" "<key>CODEX_BACKUP_COMPUTER_NAME</key><string>Office &amp; Studio</string>"
   assert_contains "$plist_path" "<key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>"
   assert_contains "$plist_path" "<key>CODEX_SNAPSHOT_DIR</key><string>$tmp_home/Custom Snapshots</string>"
   assert_contains "$plist_path" "<key>CODEX_SNAPSHOT_STAGING_DIR</key><string>$tmp_home/Custom Staging</string>"
@@ -2541,6 +2550,110 @@ test_snapshot_can_rerun_same_day() {
   cleanup_home "$tmp_home"
 }
 
+test_snapshot_default_paths_follow_runtime_computer_name() {
+  local tmp_home src_file first_archive second_archive fake_bin computer_name_path
+
+  tmp_home="$(new_home)"
+  fake_bin="$tmp_home/fake-bin"
+  computer_name_path="$tmp_home/computer-name"
+  src_file="$tmp_home/.codex/sessions/day/rollout-computer-path.jsonl"
+  mkdir -p "$fake_bin" "$(dirname "$src_file")"
+  cat > "$fake_bin/scutil" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+[ "${1:-}" = "--get" ] && [ "${2:-}" = "ComputerName" ]
+cat "$TMP_FAKE_SCUTIL_NAME"
+EOF
+  chmod +x "$fake_bin/scutil"
+  printf '{"step":1}\n' > "$src_file"
+
+  printf 'MacBook Air\n' > "$computer_name_path"
+  HOME="$tmp_home" PATH="$fake_bin:$PATH" TMP_FAKE_SCUTIL_NAME="$computer_name_path" \
+    env -u CODEX_BACKUP_COMPUTER_NAME bash "$SNAPSHOT_SCRIPT"
+  first_archive="$(snapshot_archive_path "$tmp_home" "MacBook Air")"
+  assert_file_exists "$first_archive"
+
+  printf 'MacBook Air (2) — Joey\n' > "$computer_name_path"
+  HOME="$tmp_home" PATH="$fake_bin:$PATH" TMP_FAKE_SCUTIL_NAME="$computer_name_path" \
+    env -u CODEX_BACKUP_COMPUTER_NAME bash "$SNAPSHOT_SCRIPT"
+  second_archive="$(snapshot_archive_path "$tmp_home" "MacBook Air (2) — Joey")"
+  assert_file_exists "$second_archive"
+  assert_not_exists "$tmp_home/OneDrive/Backup/dotfiles/codex/snapshots"
+
+  cleanup_home "$tmp_home"
+}
+
+test_snapshot_explicit_directory_does_not_require_computer_name() {
+  local tmp_home fake_bin src_file archive_path
+
+  tmp_home="$(new_home)"
+  fake_bin="$tmp_home/fake-bin"
+  src_file="$tmp_home/.codex/sessions/day/rollout-explicit-snapshot-dir.jsonl"
+  archive_path="$tmp_home/Custom Snapshots/codex-rollouts-$(date +%Y-%m-%d).tar"
+  if command -v zstd >/dev/null 2>&1; then
+    archive_path="$archive_path.zst"
+  else
+    archive_path="$archive_path.gz"
+  fi
+  mkdir -p "$fake_bin" "$(dirname "$src_file")"
+  cat > "$fake_bin/scutil" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+  chmod +x "$fake_bin/scutil"
+  printf '{"step":1}\n' > "$src_file"
+
+  HOME="$tmp_home" \
+    PATH="$fake_bin:$PATH" \
+    CODEX_SNAPSHOT_DIR="$tmp_home/Custom Snapshots" \
+    env -u CODEX_BACKUP_COMPUTER_NAME bash "$SNAPSHOT_SCRIPT"
+
+  assert_file_exists "$archive_path"
+  cleanup_home "$tmp_home"
+}
+
+test_snapshot_fails_closed_without_valid_computer_name() {
+  local tmp_home fake_bin status invalid_name
+  local invalid_names=("Bad/Name" 'Bad\Name' '..' 'Bad:' 'Bad*Name' 'Bad?Name' 'Bad"Name' 'Bad<Name' 'Bad>Name' 'Bad|Name' 'Trailing.' 'Trailing ' ' Leading' '.lock' 'CON' 'PRN' 'AUX' 'NUL' 'COM0' 'COM9' 'LPT0' 'LPT9' 'desktop.ini' '~$lock' 'Mac_vti_Name' $'Bad\nName')
+
+  tmp_home="$(new_home)"
+  fake_bin="$tmp_home/fake-bin"
+  mkdir -p "$fake_bin"
+  cat > "$fake_bin/scutil" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+  chmod +x "$fake_bin/scutil"
+
+  set +e
+  HOME="$tmp_home" PATH="$fake_bin:$PATH" env -u CODEX_BACKUP_COMPUTER_NAME bash "$SNAPSHOT_SCRIPT" \
+    > "$tmp_home/no-name.out" 2> "$tmp_home/no-name.err"
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    printf 'Expected snapshot to fail when scutil cannot read ComputerName\n' >&2
+    exit 1
+  fi
+  assert_contains "$tmp_home/no-name.err" "Unable to read macOS ComputerName with scutil"
+  assert_not_exists "$tmp_home/OneDrive/Backup/dotfiles/codex"
+
+  for invalid_name in "${invalid_names[@]}"; do
+    set +e
+    HOME="$tmp_home" CODEX_BACKUP_COMPUTER_NAME="$invalid_name" bash "$SNAPSHOT_SCRIPT" \
+      > "$tmp_home/invalid-name.out" 2> "$tmp_home/invalid-name.err"
+    status=$?
+    set -e
+    if [ "$status" -eq 0 ]; then
+      printf 'Expected snapshot to reject invalid computer name: %q\n' "$invalid_name" >&2
+      exit 1
+    fi
+    assert_contains "$tmp_home/invalid-name.err" "Snapshot directory resolution failed"
+    assert_not_exists "$tmp_home/OneDrive/Backup/dotfiles/codex"
+  done
+
+  cleanup_home "$tmp_home"
+}
+
 test_snapshot_retries_transient_publish_rename_failure() {
   local tmp_home archive_path log_path fake_bin state_dir src_file staging_dir
 
@@ -2573,7 +2686,7 @@ test_snapshot_retries_transient_publish_rename_failure() {
     printf 'Did not expect final publish rename to move directly from staging\n' >&2
     exit 1
   fi
-  if find "$tmp_home/OneDrive/Backup/dotfiles/codex/snapshots" -name '*.tmp.*' -print | grep -q .; then
+  if find "$tmp_home/OneDrive/Backup/dotfiles/codex/$TEST_DEFAULT_COMPUTER_NAME/snapshots" -name '*.tmp.*' -print | grep -q .; then
     printf 'Did not expect snapshot tmp files under OneDrive snapshots\n' >&2
     exit 1
   fi
@@ -2702,7 +2815,7 @@ test_snapshot_preserves_staging_file_when_publish_retries_are_exhausted() {
     printf 'Expected snapshot tmp file to remain in staging after publish failure\n' >&2
     exit 1
   fi
-  if find "$tmp_home/OneDrive/Backup/dotfiles/codex/snapshots" -name '*.tmp.*' -print | grep -q .; then
+  if find "$tmp_home/OneDrive/Backup/dotfiles/codex/$TEST_DEFAULT_COMPUTER_NAME/snapshots" -name '*.tmp.*' -print | grep -q .; then
     printf 'Did not expect snapshot publish tmp files to remain under OneDrive snapshots\n' >&2
     exit 1
   fi
@@ -3077,6 +3190,9 @@ test_snapshot_suppresses_delayed_relocation_after_disappear
 test_snapshot_suppresses_delayed_relocation_after_disappear_during_mirror_sync
 test_snapshot_skips_empty_source
 test_snapshot_can_rerun_same_day
+test_snapshot_default_paths_follow_runtime_computer_name
+test_snapshot_explicit_directory_does_not_require_computer_name
+test_snapshot_fails_closed_without_valid_computer_name
 test_snapshot_retries_transient_publish_rename_failure
 test_snapshot_allows_staging_dir_to_match_snapshot_dir
 test_snapshot_sanitizes_invalid_publish_rename_attempts
