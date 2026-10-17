@@ -4,13 +4,17 @@ set -euo pipefail
 # Keep the canonical scheduled checkout free of Python bytecode from this process tree.
 export PYTHONDONTWRITEBYTECODE=1
 
-SNAP_DIR="${CODEX_SNAPSHOT_DIR:-$HOME/OneDrive/Backup/dotfiles/codex/snapshots}"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ -n "${CODEX_SNAPSHOT_DIR:-}" ]; then
+  SNAP_DIR="$CODEX_SNAPSHOT_DIR"
+else
+  SNAP_DIR="$(python3 "$SCRIPT_DIR/codex_snapshot_path.py" "$HOME")"
+fi
 LOG="$HOME/Library/Logs/codex_snapshot_daily.log"
 TMP_LIST=""
 TMP_OUT=""
 PUBLISH_OUT=""
 SNAPSHOT_STAGING_IDENTITY=""
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MIRROR_SUPPRESSED=""
 
 # shellcheck source=scripts/codex_rollout_mirror_common.sh
