@@ -50,12 +50,10 @@ def is_within(path: str, directory: str) -> bool:
 
 def validate(codex_root: str, output_paths: tuple[str, ...]) -> None:
     root_exists = require_directory(codex_root, "Snapshot source root")
-    source_paths = []
+    source_paths = [os.path.join(codex_root, source_name) for source_name in SOURCE_NAMES]
     if root_exists:
-        for source_name in SOURCE_NAMES:
-            source_path = os.path.join(codex_root, source_name)
-            if require_directory(source_path, "Snapshot source path"):
-                source_paths.append(source_path)
+        for source_path in source_paths:
+            require_directory(source_path, "Snapshot source path")
 
     for output_path in output_paths:
         for source_path in source_paths:

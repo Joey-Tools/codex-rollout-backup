@@ -2219,6 +2219,66 @@ test_snapshot_rejects_output_nested_inside_source() {
   cleanup_home "$tmp_home"
 }
 
+test_snapshot_rejects_outputs_nested_under_missing_source_trees() {
+  local tmp_home case_name source_root missing_tree unsafe_output status
+
+  for case_name in missing-root staging-under-missing-sessions state-under-missing-archive; do
+    tmp_home="$(new_home)"
+    source_root="$tmp_home/source-root"
+    case "$case_name" in
+      missing-root)
+        source_root="$tmp_home/missing-codex"
+        missing_tree="$source_root/sessions"
+        unsafe_output="$missing_tree/snapshot-output"
+        ;;
+      staging-under-missing-sessions)
+        mkdir -p "$source_root/archived_sessions/old"
+        missing_tree="$source_root/sessions"
+        unsafe_output="$missing_tree/snapshot-staging"
+        ;;
+      state-under-missing-archive)
+        mkdir -p "$source_root/sessions/existing"
+        missing_tree="$source_root/archived_sessions"
+        unsafe_output="$missing_tree/state"
+        ;;
+    esac
+
+    set +e
+    case "$case_name" in
+      missing-root)
+        HOME="$tmp_home" CODEX_ROOT="$source_root" CODEX_SNAPSHOT_DIR="$unsafe_output" \
+          bash "$SNAPSHOT_SCRIPT" > "$tmp_home/missing-output.out" 2> "$tmp_home/missing-output.err"
+        ;;
+      staging-under-missing-sessions)
+        HOME="$tmp_home" CODEX_ROOT="$source_root" CODEX_SNAPSHOT_DIR="$tmp_home/output" \
+          CODEX_SNAPSHOT_STAGING_DIR="$unsafe_output" bash "$SNAPSHOT_SCRIPT" \
+          > "$tmp_home/missing-output.out" 2> "$tmp_home/missing-output.err"
+        ;;
+      state-under-missing-archive)
+        HOME="$tmp_home" CODEX_ROOT="$source_root" CODEX_SNAPSHOT_DIR="$tmp_home/output" \
+          CODEX_BACKUP_STATE_ROOT="$unsafe_output" bash "$SNAPSHOT_SCRIPT" \
+          > "$tmp_home/missing-output.out" 2> "$tmp_home/missing-output.err"
+        ;;
+    esac
+    status=$?
+    set -e
+
+    if [ "$status" -ne 2 ]; then
+      printf 'Expected nested output under missing source tree to fail with status 2 (%s), got %s\n' \
+        "$case_name" "$status" >&2
+      exit 1
+    fi
+    assert_contains "$tmp_home/missing-output.err" \
+      "Snapshot output path is inside Codex source tree: $unsafe_output"
+    assert_not_exists "$missing_tree"
+    if [ "$case_name" = "missing-root" ]; then
+      assert_not_exists "$source_root"
+    fi
+
+    cleanup_home "$tmp_home"
+  done
+}
+
 test_snapshot_allows_output_symlink_alias_outside_source() {
   local tmp_home source_root output_target output_alias archive_path
 
@@ -2378,6 +2438,7 @@ test_snapshot_lock_rejects_concurrent_zstd_run
 test_snapshot_rejects_source_root_symlink
 test_snapshot_rejects_source_tree_symlink
 test_snapshot_rejects_output_nested_inside_source
+test_snapshot_rejects_outputs_nested_under_missing_source_trees
 test_snapshot_allows_output_symlink_alias_outside_source
 test_sync_safe_helper_uses_apfs_reflink_and_absent_private_stage
 test_sync_safe_helper_rejects_inherited_destination_acl
