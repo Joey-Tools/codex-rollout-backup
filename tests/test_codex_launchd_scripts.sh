@@ -329,7 +329,7 @@ case "${1:-}" in
   */codex_snapshot_lock.py)
     exit 0
     ;;
-  */codex_snapshot_path.py)
+  */codex_snapshot_path.py|*/codex_snapshot_validate_trees.py)
     exec "${TMP_REAL_PYTHON3:-/usr/bin/python3}" "$@"
     ;;
   */codex_repair_rollout_reflinks.py)
@@ -479,6 +479,29 @@ set -euo pipefail
 exit 98
 EOF
   chmod +x "$tar_path"
+}
+
+setup_partial_failure_zstd() {
+  local zstd_path="$1"
+
+  mkdir -p "$(dirname "$zstd_path")"
+  cat > "$zstd_path" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+output=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    shift
+    output="${1:?}"
+  fi
+  shift
+done
+[ -n "$output" ] || exit 96
+printf 'partial compressed stream' > "$output"
+exit 2
+EOF
+  chmod +x "$zstd_path"
 }
 
 setup_partial_sync_tmp_mktemp() {
@@ -759,14 +782,46 @@ snapshot_archive_list() {
   fi
 }
 
+snapshot_archive_verbose_list() {
+  local archive_path="$1"
+
+  if [[ "$archive_path" == *.zst ]]; then
+    zstd -dc "$archive_path" | tar -tvf -
+  else
+    gzip -dc "$archive_path" | tar -tvf -
+  fi
+}
+
 extract_snapshot_file() {
   local archive_path="$1"
   local rel="$2"
+  local python_code
+
+  python_code='
+import sys
+import tarfile
+
+archive = tarfile.open(fileobj=sys.stdin.buffer, mode="r|")
+found = False
+for member in archive:
+    if member.name == sys.argv[1]:
+        source = archive.extractfile(member)
+        if source is None:
+            sys.exit(1)
+        while True:
+            chunk = source.read(65536)
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+        found = True
+if not found:
+    sys.exit(1)
+'
 
   if [[ "$archive_path" == *.zst ]]; then
-    zstd -dc "$archive_path" | tar -xOf - "$rel"
+    zstd -dc "$archive_path" | python3 -c "$python_code" "$rel"
   else
-    gzip -dc "$archive_path" | tar -xOf - "$rel"
+    gzip -dc "$archive_path" | python3 -c "$python_code" "$rel"
   fi
 }
 
@@ -778,6 +833,17 @@ assert_archive_contains() {
     printf 'Expected archive %s to contain: %s\n' "$archive_path" "$rel" >&2
     exit 1
   fi
+}
+
+assert_archive_path_exists() {
+  local archive_path="$1"
+  local rel="$2"
+
+  if snapshot_archive_list "$archive_path" | grep -Fx -e "$rel" -e "$rel/" >/dev/null; then
+    return 0
+  fi
+  printf 'Expected archive %s to contain path: %s\n' "$archive_path" "$rel" >&2
+  exit 1
 }
 
 assert_archive_not_contains() {
@@ -860,8 +926,8 @@ test_snapshot_skips_missing_source() {
   HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
 
   assert_file_exists "$log_path"
-  assert_contains "$log_path" "Source rollout directories missing, snapshotting existing mirror"
-  assert_contains "$log_path" "No mirrored rollout files found, skipping snapshot."
+  assert_contains "$log_path" "Source rollout directories missing, skipping snapshot."
+  assert_not_exists "$(snapshot_archive_path "$tmp_home")"
   cleanup_home "$tmp_home"
 }
 
@@ -908,294 +974,168 @@ test_snapshot_disables_bytecode_writes_for_python_children() {
     "PYTHONDONTWRITEBYTECODE=1 $SNAPSHOT_LOCK_HELPER acquire"
   assert_contains "$state_dir/python3.log" \
     "PYTHONDONTWRITEBYTECODE=1 $SNAPSHOT_LOCK_HELPER verify"
-  assert_contains "$state_dir/python3.log" \
-    "PYTHONDONTWRITEBYTECODE=1 $REPO_ROOT/scripts/codex_repair_rollout_reflinks.py recover"
-  assert_contains "$state_dir/python3.log" \
-    "PYTHONDONTWRITEBYTECODE=1 $REPO_ROOT/scripts/codex_repair_rollout_reflinks.py retry"
+  assert_not_contains "$state_dir/python3.log" "codex_repair_rollout_reflinks.py"
 
   cleanup_home "$tmp_home"
 }
 
-test_snapshot_updates_mirror_and_archive_from_complete_lines() {
-  local tmp_home src_file mirror_file expected_file archive_path
+test_snapshot_archives_complete_source_trees_without_touching_mirror() {
+  local tmp_home source_root sessions_root archived_root archive_path mirror_file expected_mirror
+  local expected_opaque expected_partial expected_special special_rel link_listing
 
   tmp_home="$(new_home)"
-  src_file="$tmp_home/.codex/sessions/day/rollout-partial.jsonl"
-  mirror_file="$tmp_home/.dotfiles/codex-backup/mirror/sessions/day/rollout-partial.jsonl"
-  expected_file="$tmp_home/expected-rollout-partial.jsonl"
-  mkdir -p "$(dirname "$src_file")"
+  source_root="$tmp_home/.codex"
+  sessions_root="$source_root/sessions"
+  archived_root="$source_root/archived_sessions"
+  archive_path="$(snapshot_archive_path "$tmp_home")"
+  mirror_file="$tmp_home/.dotfiles/codex-backup/mirror/sessions/legacy/retained.bin"
+  expected_mirror="$tmp_home/expected-legacy-mirror.bin"
+  expected_opaque="$tmp_home/expected-opaque.zst"
+  expected_partial="$tmp_home/expected-partial.jsonl"
+  expected_special="$tmp_home/expected-special-name.bin"
+  special_rel=$'sessions/special\tline\nback\\slash'
 
-  printf '{"step":1}\n{"step":2' > "$src_file"
-  printf '{"step":1}\n' > "$expected_file"
+  mkdir -p "$sessions_root/.hidden-dir" "$sessions_root/nested/empty" \
+    "$archived_root/old/empty" "$(dirname "$mirror_file")"
+  printf '\000ZSTD\377opaque\000bytes' > "$sessions_root/archive.zst"
+  printf '\n{"partial":true' > "$sessions_root/arbitrary-name"
+  printf '\n{"partial":true' > "$expected_partial"
+  printf '\000ZSTD\377opaque\000bytes' > "$expected_opaque"
+  printf 'special-name payload\000' > "$sessions_root/${special_rel#sessions/}"
+  cp "$sessions_root/${special_rel#sessions/}" "$expected_special"
+  : > "$sessions_root/.hidden-dir/.hidden-file"
+  printf 'no extension\000payload' > "$archived_root/no-extension"
+  printf 'legacy mirror sentinel\000' > "$mirror_file"
+  cp "$mirror_file" "$expected_mirror"
+  ln -s "$tmp_home/outside-target" "$archived_root/child-link"
+  printf 'must not be archived through symlink\n' > "$tmp_home/outside-target"
 
   HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
 
-  archive_path="$(snapshot_archive_path "$tmp_home")"
+  assert_file_exists "$archive_path"
+  assert_archive_path_exists "$archive_path" "sessions/nested/empty"
+  assert_archive_path_exists "$archive_path" "archived_sessions/old/empty"
+  assert_archive_file_equals "$archive_path" "sessions/archive.zst" "$expected_opaque"
+  assert_archive_file_equals "$archive_path" "sessions/arbitrary-name" "$expected_partial"
+  assert_archive_file_equals "$archive_path" "$special_rel" "$expected_special"
+  assert_archive_file_equals "$archive_path" "sessions/.hidden-dir/.hidden-file" \
+    "$sessions_root/.hidden-dir/.hidden-file"
+  assert_archive_path_exists "$archive_path" "archived_sessions/no-extension"
+  assert_archive_path_exists "$archive_path" "archived_sessions/child-link"
+  assert_archive_not_contains "$archive_path" "archived_sessions/outside-target"
+  link_listing="$(snapshot_archive_verbose_list "$archive_path")"
+  if ! printf '%s\n' "$link_listing" | grep -E '^l[^[:space:]]*[[:space:]].* archived_sessions/child-link( -> .*)?$' >/dev/null; then
+    printf 'Expected child symlink to be stored as a symlink in the archive\n' >&2
+    exit 1
+  fi
+  assert_archive_not_contains "$archive_path" "sessions/../../outside-target"
   assert_file_exists "$mirror_file"
-  assert_file_exists "$archive_path"
-  cmp -s "$expected_file" "$mirror_file"
-  assert_archive_contains "$archive_path" "sessions/day/rollout-partial.jsonl"
-  assert_archive_file_equals "$archive_path" "sessions/day/rollout-partial.jsonl" "$expected_file"
-  assert_not_exists "$tmp_home/OneDrive/Backup/dotfiles/codex/sessions/day/rollout-partial.jsonl"
+  assert_contains "$mirror_file" "legacy mirror sentinel"
+  assert_archive_not_contains "$archive_path" "sessions/legacy/retained.bin"
+  cmp -s "$expected_mirror" "$mirror_file"
 
-  printf '}\n' >> "$src_file"
-  printf '{"step":1}\n{"step":2}\n' > "$expected_file"
+  cleanup_home "$tmp_home"
+}
+
+test_snapshot_archives_one_existing_source_tree() {
+  local tmp_home archive_path archived_file
+
+  tmp_home="$(new_home)"
+  archived_file="$tmp_home/.codex/archived_sessions/one-sided/rollout.zst"
+  mkdir -p "$(dirname "$archived_file")"
+  printf '\000opaque archived bytes\377' > "$archived_file"
+
   HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
 
-  cmp -s "$expected_file" "$mirror_file"
-  assert_archive_file_equals "$archive_path" "sessions/day/rollout-partial.jsonl" "$expected_file"
-
-  cleanup_home "$tmp_home"
-}
-
-test_snapshot_runs_recover_sync_retry_before_publish() {
-  local tmp_home fake_bin state_dir src_file mirror_file archive_path log_path order_log hook_path
-
-  tmp_home="$(new_home)"
-  fake_bin="$tmp_home/fake-bin"
-  state_dir="$tmp_home/fake-reflink-retry-state"
-  src_file="$tmp_home/.codex/sessions/day/rollout-retry-success.jsonl"
-  mirror_file="$tmp_home/.dotfiles/codex-backup/mirror/sessions/day/rollout-retry-success.jsonl"
   archive_path="$(snapshot_archive_path "$tmp_home")"
-  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
-  order_log="$tmp_home/reflink-order.log"
-  hook_path="$tmp_home/fake-bin/record-sync-order"
-
-  mkdir -p "$(dirname "$src_file")"
-  setup_fake_reflink_maintenance_python3 "$fake_bin/python3"
-  setup_order_recording_tar "$fake_bin/tar"
-  cat > "$hook_path" <<'EOF'
-#!/bin/bash
-set -euo pipefail
-
-if [ "${1:?}" = "before_stat" ]; then
-  printf 'sync\n' >> "${TMP_FAKE_REFLINK_ORDER_LOG:?}"
-fi
-EOF
-  chmod +x "$hook_path"
-  printf '{"step":1}\n' > "$src_file"
-
-  HOME="$tmp_home" \
-    PATH="$fake_bin:$PATH" \
-    CODEX_ROLLOUT_MIRROR_TEST_HOOK="$hook_path" \
-    TMP_FAKE_REFLINK_RETRY_STATE="$state_dir" \
-    TMP_FAKE_REFLINK_RETRY_REQUIRE_PATH="$mirror_file" \
-    TMP_FAKE_REFLINK_ORDER_LOG="$order_log" \
-    bash "$SNAPSHOT_SCRIPT"
-
   assert_file_exists "$archive_path"
-  assert_archive_contains "$archive_path" "sessions/day/rollout-retry-success.jsonl"
-  assert_contains "$state_dir/python3.log" "$REPO_ROOT/scripts/codex_repair_rollout_reflinks.py recover --apply --json"
-  assert_contains "$state_dir/python3.log" "$REPO_ROOT/scripts/codex_repair_rollout_reflinks.py retry --apply --json"
-  if [ "$(tr '\n' ' ' < "$order_log")" != "recover sync retry archive " ]; then
-    printf 'Expected recover -> sync -> retry -> archive ordering, got: %s\n' "$(tr '\n' ' ' < "$order_log")" >&2
-    exit 1
-  fi
-  assert_contains "$log_path" '{"command":"recover","status":0}'
-  assert_contains "$log_path" '{"command":"retry","status":0}'
+  assert_archive_file_equals "$archive_path" "archived_sessions/one-sided/rollout.zst" "$archived_file"
+  assert_archive_not_contains "$archive_path" "sessions"
 
   cleanup_home "$tmp_home"
 }
 
-test_snapshot_stops_and_cleans_temps_when_reflink_retry_is_fatal() {
-  local tmp_home fake_bin state_dir src_file mirror_file archive_path log_path tmp_dir status
+test_snapshot_skips_when_both_source_trees_are_missing() {
+  local tmp_home archive_path log_path old_mirror
 
   tmp_home="$(new_home)"
-  fake_bin="$tmp_home/fake-bin"
-  state_dir="$tmp_home/fake-reflink-retry-state"
-  src_file="$tmp_home/.codex/sessions/day/rollout-retry-fatal.jsonl"
-  mirror_file="$tmp_home/.dotfiles/codex-backup/mirror/sessions/day/rollout-retry-fatal.jsonl"
   archive_path="$(snapshot_archive_path "$tmp_home")"
   log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
-  tmp_dir="$tmp_home/tmp"
+  old_mirror="$tmp_home/.dotfiles/codex-backup/mirror/sessions/legacy/retained.bin"
+  mkdir -p "$tmp_home/.codex"
+  mkdir -p "$(dirname "$old_mirror")"
+  printf 'legacy mirror must not be used\n' > "$old_mirror"
+  HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
 
-  mkdir -p "$(dirname "$src_file")" "$tmp_dir"
-  setup_fake_reflink_maintenance_python3 "$fake_bin/python3"
-  printf '{"step":1}\n' > "$src_file"
+  assert_contains "$log_path" "Source rollout directories missing, skipping snapshot."
+  assert_not_exists "$archive_path"
+  assert_contains "$old_mirror" "legacy mirror must not be used"
+
+  cleanup_home "$tmp_home"
+}
+
+test_snapshot_does_not_publish_when_tar_fails() {
+  local tmp_home source_file fake_bin marker archive_path expected_archive status
+
+  tmp_home="$(new_home)"
+  source_file="$tmp_home/.codex/sessions/opaque-file"
+  fake_bin="$tmp_home/fake-bin"
+  marker="$tmp_home/tar-failed.marker"
+  archive_path="$(snapshot_archive_path "$tmp_home")"
+  expected_archive="$tmp_home/expected-existing-archive"
+  mkdir -p "$(dirname "$source_file")" "$fake_bin"
+  printf 'opaque source bytes' > "$source_file"
+  mkdir -p "$(dirname "$archive_path")"
+  printf 'previous complete archive\000sentinel' > "$archive_path"
+  cp "$archive_path" "$expected_archive"
+  setup_forbidden_tar "$fake_bin/tar"
 
   set +e
-  HOME="$tmp_home" \
-    PATH="$fake_bin:$PATH" \
-    TMPDIR="$tmp_dir" \
-    TMP_FAKE_REFLINK_RETRY_STATE="$state_dir" \
-    TMP_FAKE_REFLINK_RETRY_REQUIRE_PATH="$mirror_file" \
-    TMP_FAKE_REFLINK_RETRY_STATUS=2 \
-    bash "$SNAPSHOT_SCRIPT"
+  HOME="$tmp_home" PATH="$fake_bin:$PATH" TMP_FORBIDDEN_TAR_MARKER="$marker" \
+    bash "$SNAPSHOT_SCRIPT" > "$tmp_home/tar-failure.out" 2> "$tmp_home/tar-failure.err"
   status=$?
   set -e
 
-  if [ "$status" -ne 2 ]; then
-    printf 'Expected fatal reflink retry to exit 2, got %s\n' "$status" >&2
+  if [ "$status" -eq 0 ]; then
+    printf 'Expected tar failure to stop snapshot publication\n' >&2
     exit 1
   fi
-  assert_not_exists "$archive_path"
-  assert_contains "$state_dir/python3.log" "$REPO_ROOT/scripts/codex_repair_rollout_reflinks.py retry --apply --json"
-  assert_contains "$log_path" '{"command":"retry","status":2}'
-  if find "$tmp_dir" -mindepth 1 -maxdepth 1 -print | grep -q .; then
-    printf 'Did not expect snapshot temporary files after fatal reflink retry\n' >&2
+  assert_file_exists "$marker"
+  cmp -s "$expected_archive" "$archive_path"
+  if find "$tmp_home/.dotfiles/codex-backup/state/snapshot-tmp" \
+    -maxdepth 1 -type f -name '*.tmp.*' -print | grep -q .; then
+    printf 'Expected failed tar staging output to be cleaned\n' >&2
     exit 1
   fi
-  if find "$(dirname "$archive_path")" -type f -print | grep -q .; then
-    printf 'Did not expect snapshot publish files after fatal reflink retry\n' >&2
-    exit 1
-  fi
-
-  HOME="$tmp_home" \
-    PATH="$fake_bin:$PATH" \
-    TMPDIR="$tmp_dir" \
-    TMP_FAKE_REFLINK_RETRY_STATE="$state_dir" \
-    TMP_FAKE_REFLINK_RETRY_REQUIRE_PATH="$mirror_file" \
-    bash "$SNAPSHOT_SCRIPT"
-  assert_file_exists "$archive_path"
 
   cleanup_home "$tmp_home"
 }
 
-test_snapshot_stops_before_sync_when_reflink_recovery_is_fatal() {
-  local tmp_home fake_bin state_dir src_file mirror_file archive_path log_path tmp_dir status
-  local expected_source expected_mirror
+test_snapshot_does_not_publish_when_zstd_fails() {
+  local tmp_home source_file fake_bin archive_path staging_dir status
 
   tmp_home="$(new_home)"
+  source_file="$tmp_home/.codex/sessions/opaque-file"
   fake_bin="$tmp_home/fake-bin"
-  state_dir="$tmp_home/fake-reflink-retry-state"
-  src_file="$tmp_home/.codex/sessions/day/rollout-recover-fatal.jsonl"
-  mirror_file="$tmp_home/.dotfiles/codex-backup/mirror/sessions/day/rollout-recover-fatal.jsonl"
-  archive_path="$(snapshot_archive_path "$tmp_home")"
-  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
-  tmp_dir="$tmp_home/tmp"
-  expected_source="$tmp_home/expected-source.jsonl"
-  expected_mirror="$tmp_home/expected-mirror.jsonl"
-
-  mkdir -p "$(dirname "$src_file")" "$(dirname "$mirror_file")" "$tmp_dir"
-  setup_fake_reflink_maintenance_python3 "$fake_bin/python3"
-  printf '{"source":"new"}\n' > "$src_file"
-  printf '{"mirror":"old"}\n' > "$mirror_file"
-  cp -p "$src_file" "$expected_source"
-  cp -p "$mirror_file" "$expected_mirror"
+  archive_path="$tmp_home/OneDrive/Backup/dotfiles/codex/$TEST_DEFAULT_COMPUTER_NAME/snapshots/codex-rollouts-$(date +%Y-%m-%d).tar.zst"
+  staging_dir="$tmp_home/.dotfiles/codex-backup/state/snapshot-tmp"
+  mkdir -p "$(dirname "$source_file")" "$fake_bin"
+  printf 'opaque source bytes' > "$source_file"
+  setup_partial_failure_zstd "$fake_bin/zstd"
 
   set +e
-  HOME="$tmp_home" \
-    PATH="$fake_bin:$PATH" \
-    TMPDIR="$tmp_dir" \
-    TMP_FAKE_REFLINK_RETRY_STATE="$state_dir" \
-    TMP_FAKE_REFLINK_RECOVER_STATUS=2 \
-    bash "$SNAPSHOT_SCRIPT"
+  HOME="$tmp_home" PATH="$fake_bin:$PATH" bash "$SNAPSHOT_SCRIPT" \
+    > "$tmp_home/zstd-failure.out" 2> "$tmp_home/zstd-failure.err"
   status=$?
   set -e
 
-  if [ "$status" -ne 2 ]; then
-    printf 'Expected fatal reflink recovery to exit 2, got %s\n' "$status" >&2
+  if [ "$status" -eq 0 ]; then
+    printf 'Expected zstd failure to stop snapshot publication\n' >&2
     exit 1
   fi
   assert_not_exists "$archive_path"
-  assert_contains "$state_dir/python3.log" "$REPO_ROOT/scripts/codex_repair_rollout_reflinks.py recover --apply --json"
-  assert_not_contains "$state_dir/python3.log" "$REPO_ROOT/scripts/codex_repair_rollout_reflinks.py retry --apply --json"
-  assert_contains "$log_path" '{"command":"recover","status":2}'
-  cmp -s "$expected_source" "$src_file"
-  cmp -s "$expected_mirror" "$mirror_file"
-  if find "$tmp_dir" -mindepth 1 -maxdepth 1 -print | grep -q .; then
-    printf 'Did not expect snapshot temporary files after fatal reflink recovery\n' >&2
-    exit 1
-  fi
-  if find "$(dirname "$archive_path")" -type f -print | grep -q .; then
-    printf 'Did not expect snapshot publish files after fatal reflink recovery\n' >&2
-    exit 1
-  fi
-
-  cleanup_home "$tmp_home"
-}
-
-test_snapshot_defers_safe_mirror_copy_without_pre_relocation() {
-  local tmp_home fake_helper helper_log archived_src stable_src stale_mirror current_mirror
-  local expected_mirror archive_path log_path
-
-  tmp_home="$(new_home)"
-  fake_helper="$tmp_home/fake-bin/codex_rollout_mirror_copy.py"
-  helper_log="$tmp_home/fake-mirror-copy.log"
-  archived_src="$tmp_home/.codex/archived_sessions/rollout-deferred-copy.jsonl"
-  stable_src="$tmp_home/.codex/sessions/stable/rollout-stable-deferred-copy.jsonl"
-  stale_mirror="$tmp_home/.dotfiles/codex-backup/mirror/sessions/day/rollout-deferred-copy.jsonl"
-  current_mirror="$tmp_home/.dotfiles/codex-backup/mirror/archived_sessions/rollout-deferred-copy.jsonl"
-  expected_mirror="$tmp_home/expected-deferred-mirror.jsonl"
-  archive_path="$(snapshot_archive_path "$tmp_home")"
-  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
-
-  mkdir -p "$(dirname "$archived_src")" "$(dirname "$stable_src")" "$(dirname "$stale_mirror")"
-  setup_fake_mirror_copy_helper "$fake_helper"
-  printf '{"archived":"new"}\n' > "$archived_src"
-  printf '{"stable":true}\n' > "$stable_src"
-  printf '{"live":"old"}\n' > "$stale_mirror"
-  cp -p "$stale_mirror" "$expected_mirror"
-
-  HOME="$tmp_home" \
-    CODEX_ROLLOUT_MIRROR_COPY_HELPER="$fake_helper" \
-    TMP_FAKE_MIRROR_COPY_TARGET_SOURCE="$archived_src" \
-    TMP_FAKE_MIRROR_COPY_STATUS=75 \
-    TMP_FAKE_MIRROR_COPY_LOG="$helper_log" \
-    TMP_REAL_MIRROR_COPY_HELPER="$REPO_ROOT/scripts/codex_rollout_mirror_copy.py" \
-    bash "$SNAPSHOT_SCRIPT"
-
-  assert_file_exists "$archive_path"
-  assert_file_exists "$stale_mirror"
-  assert_not_exists "$current_mirror"
-  cmp -s "$expected_mirror" "$stale_mirror"
-  assert_archive_contains "$archive_path" "sessions/stable/rollout-stable-deferred-copy.jsonl"
-  assert_archive_not_contains "$archive_path" "sessions/day/rollout-deferred-copy.jsonl"
-  assert_archive_not_contains "$archive_path" "archived_sessions/rollout-deferred-copy.jsonl"
-  assert_contains "$helper_log" "sync-one $archived_src status=75"
-  assert_contains "$helper_log" "validate-receipt $archived_src status=75"
-  assert_contains "$log_path" "Source rollout disappeared during mirror sync, skipping: archived_sessions/rollout-deferred-copy.jsonl"
-  assert_not_contains "$log_path" "Mirror relocate sessions/day/rollout-deferred-copy.jsonl"
-
-  cleanup_home "$tmp_home"
-}
-
-test_snapshot_stops_when_safe_mirror_copy_is_fatal() {
-  local tmp_home fake_helper helper_log src_file mirror_file expected_source expected_mirror
-  local archive_path log_path tmp_dir status
-
-  tmp_home="$(new_home)"
-  fake_helper="$tmp_home/fake-bin/codex_rollout_mirror_copy.py"
-  helper_log="$tmp_home/fake-mirror-copy.log"
-  src_file="$tmp_home/.codex/sessions/day/rollout-copy-fatal.jsonl"
-  mirror_file="$tmp_home/.dotfiles/codex-backup/mirror/sessions/day/rollout-copy-fatal.jsonl"
-  expected_source="$tmp_home/expected-copy-fatal-source.jsonl"
-  expected_mirror="$tmp_home/expected-copy-fatal-mirror.jsonl"
-  archive_path="$(snapshot_archive_path "$tmp_home")"
-  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
-  tmp_dir="$tmp_home/tmp"
-
-  mkdir -p "$(dirname "$src_file")" "$(dirname "$mirror_file")" "$tmp_dir"
-  setup_fake_mirror_copy_helper "$fake_helper"
-  printf '{"source":"new and longer"}\n' > "$src_file"
-  printf '{"mirror":"old"}\n' > "$mirror_file"
-  cp -p "$src_file" "$expected_source"
-  cp -p "$mirror_file" "$expected_mirror"
-
-  set +e
-  HOME="$tmp_home" \
-    TMPDIR="$tmp_dir" \
-    CODEX_ROLLOUT_MIRROR_COPY_HELPER="$fake_helper" \
-    TMP_FAKE_MIRROR_COPY_TARGET_SOURCE="$src_file" \
-    TMP_FAKE_MIRROR_COPY_STATUS=2 \
-    TMP_FAKE_MIRROR_COPY_LOG="$helper_log" \
-    TMP_REAL_MIRROR_COPY_HELPER="$REPO_ROOT/scripts/codex_rollout_mirror_copy.py" \
-    bash "$SNAPSHOT_SCRIPT"
-  status=$?
-  set -e
-
-  if [ "$status" -ne 2 ]; then
-    printf 'Expected fatal safe mirror copy to exit 2, got %s\n' "$status" >&2
-    exit 1
-  fi
-  assert_not_exists "$archive_path"
-  cmp -s "$expected_source" "$src_file"
-  cmp -s "$expected_mirror" "$mirror_file"
-  assert_contains "$helper_log" "sync-one $src_file status=2"
-  assert_contains "$helper_log" "validate-receipt $src_file status=2"
-  assert_contains "$log_path" "Safe mirror sync failed: sessions/day/rollout-copy-fatal.jsonl (status 2)"
-  if find "$tmp_dir" -mindepth 1 -maxdepth 1 -print | grep -q .; then
-    printf 'Did not expect mirror or snapshot temporary files after fatal safe copy\n' >&2
+  if find "$staging_dir" -maxdepth 1 -type f -name '*.tmp.*' -print | grep -q .; then
+    printf 'Expected failed zstd staging output to be cleaned\n' >&2
     exit 1
   fi
 
@@ -1684,655 +1624,6 @@ test_sync_requires_nonempty_log_before_touching_mirror_state() {
   cleanup_home "$tmp_home"
 }
 
-test_snapshot_stops_on_partial_source_or_mirror_enumeration_failure() {
-  local tmp_home case_name fake_bin sessions_src archived_src mirror_file
-  local expected_sessions expected_archived expected_mirror fail_root partial_path
-  local hook_path hook_marker tar_marker archive_path log_path tmp_dir status expected_log
-
-  for case_name in sessions archived_sessions mirror; do
-    tmp_home="$(new_home)"
-    fake_bin="$tmp_home/fake-bin"
-    sessions_src="$tmp_home/.codex/sessions/day/rollout-enumeration-sessions.jsonl"
-    archived_src="$tmp_home/.codex/archived_sessions/rollout-enumeration-archived.jsonl"
-    mirror_file="$tmp_home/.dotfiles/codex-backup/mirror/sessions/day/rollout-enumeration-existing.jsonl"
-    expected_sessions="$tmp_home/expected-enumeration-sessions.jsonl"
-    expected_archived="$tmp_home/expected-enumeration-archived.jsonl"
-    expected_mirror="$tmp_home/expected-enumeration-mirror.jsonl"
-    hook_path="$fake_bin/forbidden-mirror-hook"
-    hook_marker="$tmp_home/forbidden-enumeration-hook.called"
-    tar_marker="$tmp_home/forbidden-enumeration-tar.called"
-    archive_path="$(snapshot_archive_path "$tmp_home")"
-    log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
-    tmp_dir="$tmp_home/tmp"
-
-    mkdir -p "$(dirname "$sessions_src")" "$(dirname "$archived_src")" \
-      "$(dirname "$mirror_file")" "$tmp_dir"
-    setup_partial_find_failure "$fake_bin/find"
-    setup_forbidden_mirror_hook "$hook_path"
-    setup_forbidden_tar "$fake_bin/tar"
-    printf '{"source":"sessions"}\n' > "$sessions_src"
-    printf '{"source":"archived"}\n' > "$archived_src"
-    printf '{"mirror":"existing"}\n' > "$mirror_file"
-    cp -p "$sessions_src" "$expected_sessions"
-    cp -p "$archived_src" "$expected_archived"
-    cp -p "$mirror_file" "$expected_mirror"
-
-    case "$case_name" in
-      sessions)
-        fail_root="$tmp_home/.codex/sessions"
-        partial_path="$sessions_src"
-        expected_log="Failed to enumerate Codex rollout sources."
-        ;;
-      archived_sessions)
-        fail_root="$tmp_home/.codex/archived_sessions"
-        partial_path="$archived_src"
-        expected_log="Failed to enumerate Codex rollout sources."
-        ;;
-      mirror)
-        fail_root="$tmp_home/.dotfiles/codex-backup/mirror"
-        partial_path="$mirror_file"
-        expected_log="Failed to enumerate Codex rollout mirror files."
-        ;;
-    esac
-
-    set +e
-    HOME="$tmp_home" \
-      PATH="$fake_bin:$PATH" \
-      TMPDIR="$tmp_dir" \
-      CODEX_ROLLOUT_MIRROR_TEST_HOOK="$hook_path" \
-      TMP_FORBIDDEN_MIRROR_HOOK_MARKER="$hook_marker" \
-      TMP_FORBIDDEN_TAR_MARKER="$tar_marker" \
-      TMP_PARTIAL_FIND_FAIL_ROOT="$fail_root" \
-      TMP_PARTIAL_FIND_OUTPUT_PATH="$partial_path" \
-      TMP_PARTIAL_FIND_STATUS=71 \
-      bash "$SNAPSHOT_SCRIPT"
-    status=$?
-    set -e
-
-    if [ "$status" -ne 1 ]; then
-      printf 'Expected partial %s enumeration to stop with 1, got %s\n' "$case_name" "$status" >&2
-      exit 1
-    fi
-    assert_contains "$log_path" "$expected_log"
-    assert_not_exists "$hook_marker"
-    assert_not_exists "$tar_marker"
-    assert_not_exists "$archive_path"
-    cmp -s "$expected_sessions" "$sessions_src"
-    cmp -s "$expected_archived" "$archived_src"
-    cmp -s "$expected_mirror" "$mirror_file"
-    if find "$tmp_dir" -mindepth 1 -maxdepth 1 -print | grep -q .; then
-      printf 'Did not expect temporary files after partial %s enumeration failure\n' "$case_name" >&2
-      exit 1
-    fi
-
-    cleanup_home "$tmp_home"
-  done
-}
-
-test_snapshot_cleans_private_sync_indexes_on_setup_and_hook_failures() {
-  local tmp_home case_name fake_bin source_path mirror_path expected_source expected_mirror
-  local hook_path hook_marker tar_marker archive_path tmp_dir mktemp_state status expected_status
-
-  for case_name in partial-index hook; do
-    tmp_home="$(new_home)"
-    fake_bin="$tmp_home/fake-bin"
-    source_path="$tmp_home/.codex/sessions/day/rollout-sync-cleanup-$case_name.jsonl"
-    mirror_path="$tmp_home/.dotfiles/codex-backup/mirror/sessions/day/rollout-sync-cleanup-$case_name.jsonl"
-    expected_source="$tmp_home/expected-sync-cleanup-source-$case_name.jsonl"
-    expected_mirror="$tmp_home/expected-sync-cleanup-mirror-$case_name.jsonl"
-    hook_path="$fake_bin/forbidden-mirror-hook"
-    hook_marker="$tmp_home/forbidden-sync-cleanup-hook.called"
-    tar_marker="$tmp_home/forbidden-sync-cleanup-tar.called"
-    archive_path="$(snapshot_archive_path "$tmp_home")"
-    tmp_dir="$tmp_home/tmp"
-    mktemp_state="$tmp_home/partial-sync-mktemp-state"
-
-    mkdir -p "$(dirname "$source_path")" "$(dirname "$mirror_path")" "$tmp_dir"
-    setup_forbidden_mirror_hook "$hook_path"
-    setup_forbidden_tar "$fake_bin/tar"
-    printf '{"source":"new and longer","case":"%s"}\n' "$case_name" > "$source_path"
-    printf '{"mirror":"old","case":"%s"}\n' "$case_name" > "$mirror_path"
-    cp -p "$source_path" "$expected_source"
-    cp -p "$mirror_path" "$expected_mirror"
-
-    if [ "$case_name" = "partial-index" ]; then
-      setup_partial_sync_tmp_mktemp "$fake_bin/mktemp"
-      expected_status=1
-    else
-      expected_status=73
-    fi
-
-    set +e
-    HOME="$tmp_home" \
-      PATH="$fake_bin:$PATH" \
-      TMPDIR="$tmp_dir" \
-      CODEX_ROLLOUT_MIRROR_TEST_HOOK="$hook_path" \
-      TMP_FORBIDDEN_MIRROR_HOOK_MARKER="$hook_marker" \
-      TMP_FORBIDDEN_MIRROR_HOOK_STATUS=73 \
-      TMP_FORBIDDEN_TAR_MARKER="$tar_marker" \
-      TMP_PARTIAL_SYNC_MKTEMP_STATE="$mktemp_state" \
-      bash "$SNAPSHOT_SCRIPT" \
-      > "$tmp_home/sync-cleanup-$case_name.out" \
-      2> "$tmp_home/sync-cleanup-$case_name.err"
-    status=$?
-    set -e
-
-    if [ "$status" -ne "$expected_status" ]; then
-      printf 'Expected %s sync failure status %s, got %s\n' \
-        "$case_name" "$expected_status" "$status" >&2
-      exit 1
-    fi
-    if [ "$case_name" = "partial-index" ]; then
-      assert_not_exists "$hook_marker"
-    else
-      assert_file_exists "$hook_marker"
-    fi
-    assert_not_exists "$tar_marker"
-    assert_not_exists "$archive_path"
-    cmp -s "$expected_source" "$source_path"
-    cmp -s "$expected_mirror" "$mirror_path"
-    if find "$tmp_dir" -mindepth 1 -maxdepth 1 -print | grep -q .; then
-      printf 'Did not expect codex-rollout-sync or snapshot temps after %s failure\n' "$case_name" >&2
-      exit 1
-    fi
-
-    cleanup_home "$tmp_home"
-  done
-}
-
-test_snapshot_fails_closed_on_tab_newline_and_backslash_rollout_paths() {
-  local tmp_home case_name fake_bin special_rel source_path mirror_path expected_source expected_mirror
-  local hook_path hook_marker tar_marker archive_path tmp_dir status expected_diagnostic
-
-  special_rel=$'sessions/tab\tline\nback\\slash/rollout-tab\tline\nback\\slash.jsonl'
-  for case_name in source mirror-only; do
-    tmp_home="$(new_home)"
-    fake_bin="$tmp_home/fake-bin"
-    source_path="$tmp_home/.codex/$special_rel"
-    mirror_path="$tmp_home/.dotfiles/codex-backup/mirror/$special_rel"
-    expected_source="$tmp_home/expected-special-source"
-    expected_mirror="$tmp_home/expected-special-mirror"
-    hook_path="$fake_bin/forbidden-mirror-hook"
-    hook_marker="$tmp_home/forbidden-special-hook.called"
-    tar_marker="$tmp_home/forbidden-special-tar.called"
-    archive_path="$(snapshot_archive_path "$tmp_home")"
-    tmp_dir="$tmp_home/tmp"
-
-    mkdir -p "$(dirname "$mirror_path")" "$tmp_dir"
-    setup_forbidden_mirror_hook "$hook_path"
-    setup_forbidden_tar "$fake_bin/tar"
-    printf '{"mirror":"special path sentinel"}\n' > "$mirror_path"
-    cp -p "$mirror_path" "$expected_mirror"
-    if [ "$case_name" = "source" ]; then
-      mkdir -p "$(dirname "$source_path")"
-      printf '{"source":"special path sentinel"}\n' > "$source_path"
-      cp -p "$source_path" "$expected_source"
-      expected_diagnostic="Unsupported rollout source path:"
-    else
-      expected_diagnostic="Unsupported rollout mirror path:"
-    fi
-
-    set +e
-    HOME="$tmp_home" \
-      PATH="$fake_bin:$PATH" \
-      TMPDIR="$tmp_dir" \
-      CODEX_ROLLOUT_MIRROR_TEST_HOOK="$hook_path" \
-      TMP_FORBIDDEN_MIRROR_HOOK_MARKER="$hook_marker" \
-      TMP_FORBIDDEN_TAR_MARKER="$tar_marker" \
-      bash "$SNAPSHOT_SCRIPT" \
-      > "$tmp_home/special-$case_name.out" \
-      2> "$tmp_home/special-$case_name.err"
-    status=$?
-    set -e
-
-    if [ "$status" -ne 2 ]; then
-      printf 'Expected %s special rollout path to fail closed with 2, got %s\n' \
-        "$case_name" "$status" >&2
-      exit 1
-    fi
-    assert_contains "$tmp_home/special-$case_name.err" "$expected_diagnostic"
-    assert_not_exists "$hook_marker"
-    assert_not_exists "$tar_marker"
-    assert_not_exists "$archive_path"
-    cmp -s "$expected_mirror" "$mirror_path"
-    if [ "$case_name" = "source" ]; then
-      cmp -s "$expected_source" "$source_path"
-    fi
-    if find "$tmp_dir" -mindepth 1 -maxdepth 1 -print | grep -q .; then
-      printf 'Did not expect path-inventory or snapshot temps after %s special-path rejection\n' \
-        "$case_name" >&2
-      exit 1
-    fi
-
-    cleanup_home "$tmp_home"
-  done
-}
-
-test_snapshot_rejects_unsafe_configured_rollout_roots_before_side_effects() {
-  local tmp_home case_name fake_bin codex_root mirror_root state_root source_path
-  local outside_root outside_sentinel expected_outside hook_path hook_marker tar_marker
-  local archive_path tmp_dir status expected_diagnostic log_path
-  local outside_root_signature outside_sentinel_signature guarded_root_path
-  local guarded_root_signature
-
-  for case_name in \
-    codex-root-delimiter \
-    mirror-root-delimiter \
-    codex-root-relative \
-    mirror-root-dotdot \
-    codex-root-symlink \
-    codex-root-file \
-    codex-root-filesystem-root \
-    mirror-root-filesystem-root \
-    source-root-symlink \
-    source-root-file \
-    mirror-root-symlink \
-    mirror-root-file; do
-    tmp_home="$(new_home)"
-    fake_bin="$tmp_home/fake-bin"
-    codex_root="$tmp_home/configured-codex"
-    mirror_root="$tmp_home/configured-mirror"
-    state_root="$tmp_home/configured-state"
-    outside_root="$tmp_home/outside-root"
-    outside_sentinel="$outside_root/sentinel"
-    expected_outside="$tmp_home/expected-outside-root-sentinel"
-    hook_path="$fake_bin/forbidden-mirror-hook"
-    hook_marker="$tmp_home/forbidden-root-hook.called"
-    tar_marker="$tmp_home/forbidden-root-tar.called"
-    archive_path="$(snapshot_archive_path "$tmp_home")"
-    tmp_dir="$tmp_home/tmp"
-    log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
-    guarded_root_path=""
-    guarded_root_signature=""
-
-    mkdir -p "$outside_root" "$tmp_dir"
-    printf 'outside root sentinel\n' > "$outside_sentinel"
-    cp -p "$outside_sentinel" "$expected_outside"
-    setup_forbidden_mirror_hook "$hook_path"
-    setup_forbidden_tar "$fake_bin/tar"
-
-    case "$case_name" in
-      codex-root-delimiter)
-        codex_root="$tmp_home/"$'configured\tcodex\nroot\\unsafe'
-        mkdir -p "$codex_root/sessions" "$mirror_root"
-        source_path="$codex_root/sessions/rollout-root-delimiter.jsonl"
-        printf '{"source":"root delimiter"}\n' > "$source_path"
-        expected_diagnostic="CODEX_ROOT contains an unsupported tab, newline, or backslash."
-        ;;
-      mirror-root-delimiter)
-        mirror_root="$tmp_home/"$'configured\tmirror\nroot\\unsafe'
-        mkdir -p "$codex_root/sessions" "$mirror_root"
-        source_path="$codex_root/sessions/rollout-mirror-root-delimiter.jsonl"
-        printf '{"source":"mirror root delimiter"}\n' > "$source_path"
-        expected_diagnostic="CODEX_MIRROR_ROOT contains an unsupported tab, newline, or backslash."
-        ;;
-      codex-root-relative)
-        codex_root="relative-codex-root"
-        expected_diagnostic="CODEX_ROOT must be absolute."
-        ;;
-      mirror-root-dotdot)
-        mirror_root="$tmp_home/configured-parent/../configured-mirror"
-        expected_diagnostic="CODEX_MIRROR_ROOT is the filesystem root or has a trailing slash, empty component, or dot component."
-        ;;
-      codex-root-symlink)
-        ln -s "$outside_root" "$codex_root"
-        guarded_root_path="$codex_root"
-        expected_diagnostic="The configured CODEX_ROOT is not a non-symlink directory."
-        ;;
-      codex-root-file)
-        printf 'not a CODEX_ROOT directory\n' > "$codex_root"
-        guarded_root_path="$codex_root"
-        expected_diagnostic="The configured CODEX_ROOT is not a non-symlink directory."
-        ;;
-      codex-root-filesystem-root)
-        codex_root="/"
-        guarded_root_path="$codex_root"
-        expected_diagnostic="CODEX_ROOT is the filesystem root or has a trailing slash, empty component, or dot component."
-        ;;
-      mirror-root-filesystem-root)
-        mirror_root="/"
-        guarded_root_path="$mirror_root"
-        expected_diagnostic="CODEX_MIRROR_ROOT is the filesystem root or has a trailing slash, empty component, or dot component."
-        ;;
-      source-root-symlink)
-        mkdir -p "$codex_root" "$mirror_root"
-        ln -s "$outside_root" "$codex_root/sessions"
-        expected_diagnostic="A configured rollout source root is not a non-symlink directory."
-        ;;
-      source-root-file)
-        mkdir -p "$codex_root" "$mirror_root"
-        printf 'not a directory\n' > "$codex_root/sessions"
-        expected_diagnostic="A configured rollout source root is not a non-symlink directory."
-        ;;
-      mirror-root-symlink)
-        mkdir -p "$codex_root/sessions"
-        ln -s "$outside_root" "$mirror_root"
-        expected_diagnostic="The configured rollout mirror root is not a non-symlink directory."
-        ;;
-      mirror-root-file)
-        mkdir -p "$codex_root/sessions"
-        printf 'not a directory\n' > "$mirror_root"
-        expected_diagnostic="The configured rollout mirror root is not a non-symlink directory."
-        ;;
-    esac
-
-    outside_root_signature="$(/usr/bin/stat -f '%d:%i:%Lp:%m' "$outside_root")"
-    outside_sentinel_signature="$(/usr/bin/stat -f '%d:%i:%Lp:%m' "$outside_sentinel")"
-    if [ -n "$guarded_root_path" ]; then
-      guarded_root_signature="$(/usr/bin/stat -f '%d:%i:%Lp:%m' "$guarded_root_path")"
-    fi
-
-    set +e
-    HOME="$tmp_home" \
-      PATH="$fake_bin:$PATH" \
-      TMPDIR="$tmp_dir" \
-      CODEX_ROOT="$codex_root" \
-      CODEX_MIRROR_ROOT="$mirror_root" \
-      CODEX_BACKUP_STATE_ROOT="$state_root" \
-      CODEX_ROLLOUT_MIRROR_TEST_HOOK="$hook_path" \
-      TMP_FORBIDDEN_MIRROR_HOOK_MARKER="$hook_marker" \
-      TMP_FORBIDDEN_TAR_MARKER="$tar_marker" \
-      bash "$SNAPSHOT_SCRIPT" \
-      > "$tmp_home/root-$case_name.out" \
-      2> "$tmp_home/root-$case_name.err"
-    status=$?
-    set -e
-
-    if [ "$status" -ne 2 ]; then
-      printf 'Expected unsafe %s configuration to fail with 2, got %s\n' \
-        "$case_name" "$status" >&2
-      exit 1
-    fi
-    assert_contains "$tmp_home/root-$case_name.err" "$expected_diagnostic"
-    assert_not_exists "$hook_marker"
-    assert_not_exists "$tar_marker"
-    assert_not_exists "$state_root"
-    assert_not_exists "$archive_path"
-    assert_not_exists "$log_path"
-    cmp -s "$expected_outside" "$outside_sentinel"
-    if [ "$(/usr/bin/stat -f '%d:%i:%Lp:%m' "$outside_root")" != "$outside_root_signature" ] || \
-      [ "$(/usr/bin/stat -f '%d:%i:%Lp:%m' "$outside_sentinel")" != "$outside_sentinel_signature" ]; then
-      printf 'Expected unsafe %s root rejection to preserve outside root and sentinel metadata\n' \
-        "$case_name" >&2
-      exit 1
-    fi
-    if [ -n "$guarded_root_path" ] && \
-      [ "$(/usr/bin/stat -f '%d:%i:%Lp:%m' "$guarded_root_path")" != "$guarded_root_signature" ]; then
-      printf 'Expected unsafe %s root rejection to preserve the configured root object\n' \
-        "$case_name" >&2
-      exit 1
-    fi
-    case "$case_name" in
-      codex-root-delimiter | mirror-root-delimiter)
-        assert_file_exists "$source_path"
-        ;;
-      codex-root-symlink)
-        [ -L "$codex_root" ] && [ "$(readlink "$codex_root")" = "$outside_root" ]
-        ;;
-      codex-root-file)
-        assert_contains "$codex_root" "not a CODEX_ROOT directory"
-        ;;
-      source-root-symlink)
-        [ -L "$codex_root/sessions" ] && [ "$(readlink "$codex_root/sessions")" = "$outside_root" ]
-        ;;
-      source-root-file)
-        assert_contains "$codex_root/sessions" "not a directory"
-        ;;
-      mirror-root-symlink)
-        [ -L "$mirror_root" ] && [ "$(readlink "$mirror_root")" = "$outside_root" ]
-        ;;
-      mirror-root-file)
-        assert_contains "$mirror_root" "not a directory"
-        ;;
-    esac
-    if find "$tmp_dir" -mindepth 1 -maxdepth 1 -print | grep -q .; then
-      printf 'Did not expect temp files before unsafe %s root rejection\n' "$case_name" >&2
-      exit 1
-    fi
-
-    cleanup_home "$tmp_home"
-  done
-}
-
-test_snapshot_defers_source_name_replacements_without_touching_old_mirror() {
-  local tmp_home mode source_path source_parent original_path mirror_path stable_path
-  local expected_source expected_mirror outside_path expected_outside hook_path hook_state
-  local archive_path log_path status status_path mirror_identity expected_identity
-  local mirror_mode expected_mode mirror_mtime expected_mtime
-
-  for mode in fifo symlink regular parent; do
-    tmp_home="$(new_home)"
-    source_path="$tmp_home/.codex/sessions/replaced/rollout-source-replaced-$mode.jsonl"
-    source_parent="$(dirname "$source_path")"
-    mirror_path="$tmp_home/.dotfiles/codex-backup/mirror/sessions/replaced/rollout-source-replaced-$mode.jsonl"
-    stable_path="$tmp_home/.codex/sessions/stable/rollout-stable-source-replaced-$mode.jsonl"
-    expected_source="$tmp_home/expected-source-replaced-$mode.jsonl"
-    expected_mirror="$tmp_home/expected-mirror-replaced-$mode.jsonl"
-    outside_path="$tmp_home/outside-source-replaced-$mode.jsonl"
-    expected_outside="$tmp_home/expected-outside-source-replaced-$mode.jsonl"
-    hook_path="$tmp_home/fake-bin/replace-held-source"
-    hook_state="$tmp_home/source-replacement-hook"
-    archive_path="$(snapshot_archive_path "$tmp_home")"
-    log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
-    status_path="$tmp_home/source-replaced-$mode.status"
-
-    mkdir -p "$source_parent" "$(dirname "$mirror_path")" "$(dirname "$stable_path")"
-    setup_source_replacement_hook "$hook_path"
-    printf '{"source":"new and longer","mode":"%s"}\n' "$mode" > "$source_path"
-    printf '{"mirror":"old","mode":"%s"}\n' "$mode" > "$mirror_path"
-    printf '{"stable":true,"mode":"%s"}\n' "$mode" > "$stable_path"
-    printf '{"outside":"sentinel","mode":"%s"}\n' "$mode" > "$outside_path"
-    cp -p "$source_path" "$expected_source"
-    cp -p "$mirror_path" "$expected_mirror"
-    cp -p "$outside_path" "$expected_outside"
-    chmod 640 "$mirror_path"
-    touch -t 202003040506.07 "$mirror_path"
-    expected_identity="$(/usr/bin/stat -f '%d:%i' "$mirror_path")"
-    expected_mode="$(/usr/bin/stat -f%Lp "$mirror_path")"
-    expected_mtime="$(/usr/bin/stat -f%m "$mirror_path")"
-
-    status="$(run_with_deadline \
-      "$status_path" \
-      /usr/bin/env \
-        HOME="$tmp_home" \
-        CODEX_ROLLOUT_MIRROR_TEST_HOOK="$hook_path" \
-        TMP_MIRROR_REPLACEMENT_STATE="$hook_state" \
-        TMP_MIRROR_REPLACEMENT_STAGE="after_source_open" \
-        TMP_MIRROR_REPLACEMENT_TARGET_PATH="$source_path" \
-        TMP_MIRROR_REPLACEMENT_MODE="$mode" \
-        TMP_MIRROR_REPLACEMENT_OUTSIDE="$outside_path" \
-        bash "$SNAPSHOT_SCRIPT")"
-    if [ "$status" -ne 0 ]; then
-      printf 'Expected %s source-name replacement to defer safely, got %s\n' "$mode" "$status" >&2
-      exit 1
-    fi
-
-    if [ "$mode" = "parent" ]; then
-      original_path="$source_parent.opened/$(basename "$source_path")"
-    else
-      original_path="$source_path.opened"
-    fi
-    assert_file_exists "$original_path"
-    cmp -s "$expected_source" "$original_path"
-    cmp -s "$expected_mirror" "$mirror_path"
-    cmp -s "$expected_outside" "$outside_path"
-    mirror_identity="$(/usr/bin/stat -f '%d:%i' "$mirror_path")"
-    mirror_mode="$(/usr/bin/stat -f%Lp "$mirror_path")"
-    mirror_mtime="$(/usr/bin/stat -f%m "$mirror_path")"
-    if [ "$mirror_identity" != "$expected_identity" ] || \
-      [ "$mirror_mode" != "$expected_mode" ] || \
-      [ "$mirror_mtime" != "$expected_mtime" ]; then
-      printf 'Expected old mirror identity and metadata to survive %s replacement\n' "$mode" >&2
-      exit 1
-    fi
-    assert_file_exists "$archive_path"
-    assert_archive_contains "$archive_path" "sessions/stable/rollout-stable-source-replaced-$mode.jsonl"
-    assert_archive_not_contains "$archive_path" "sessions/replaced/rollout-source-replaced-$mode.jsonl"
-    assert_contains "$log_path" "Source rollout disappeared during mirror sync, skipping: sessions/replaced/rollout-source-replaced-$mode.jsonl"
-    if find "$tmp_home/.dotfiles/codex-backup/mirror" -type d -name '.*stage*' -print | grep -q .; then
-      printf 'Did not expect helper staging directories after %s replacement\n' "$mode" >&2
-      exit 1
-    fi
-
-    cleanup_home "$tmp_home"
-  done
-}
-
-test_snapshot_defers_no_complete_same_inode_rewrite() {
-  local tmp_home source_path mirror_path stable_path expected_mirror expected_rewrite
-  local hook_path hook_state archive_path log_path tmp_dir status_path status
-  local source_identity mirror_identity mirror_mode mirror_mtime
-
-  tmp_home="$(new_home)"
-  source_path="$tmp_home/.codex/sessions/day/rollout-no-complete-rewrite.jsonl"
-  mirror_path="$tmp_home/.dotfiles/codex-backup/mirror/sessions/day/rollout-no-complete-rewrite.jsonl"
-  stable_path="$tmp_home/.codex/sessions/day/rollout-stable-during-no-complete-rewrite.jsonl"
-  expected_mirror="$tmp_home/expected-no-complete-rewrite-mirror.jsonl"
-  expected_rewrite="$tmp_home/expected-no-complete-rewrite-source.jsonl"
-  hook_path="$tmp_home/fake-bin/source-replacement-hook"
-  hook_state="$tmp_home/no-complete-rewrite-hook-state"
-  archive_path="$(snapshot_archive_path "$tmp_home")"
-  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
-  tmp_dir="$tmp_home/tmp"
-  status_path="$tmp_home/no-complete-rewrite.status"
-
-  mkdir -p "$(dirname "$source_path")" "$(dirname "$mirror_path")" "$tmp_dir"
-  printf '{"step":2' > "$source_path"
-  printf '{"step":9' > "$expected_rewrite"
-  printf '{"step":1}\n' > "$mirror_path"
-  printf '{"step":1}\n' > "$expected_mirror"
-  printf '{"stable":true}\n' > "$stable_path"
-  setup_source_replacement_hook "$hook_path"
-
-  source_identity="$(/usr/bin/stat -f '%d:%i' "$source_path")"
-  mirror_identity="$(/usr/bin/stat -f '%d:%i' "$mirror_path")"
-  mirror_mode="$(/usr/bin/stat -f%Lp "$mirror_path")"
-  mirror_mtime="$(/usr/bin/stat -f%m "$mirror_path")"
-
-  status="$(run_with_deadline "$status_path" \
-    env \
-      HOME="$tmp_home" \
-      TMPDIR="$tmp_dir" \
-      CODEX_ROLLOUT_MIRROR_TEST_HOOK="$hook_path" \
-      TMP_MIRROR_REPLACEMENT_STATE="$hook_state" \
-      TMP_MIRROR_REPLACEMENT_STAGE="before_cleanup" \
-      TMP_MIRROR_REPLACEMENT_TARGET_PATH="$source_path" \
-      TMP_MIRROR_REPLACEMENT_MODE="same-inode-rewrite" \
-      TMP_MIRROR_REPLACEMENT_REWRITE='{"step":9' \
-      bash "$SNAPSHOT_SCRIPT")"
-  if [ "$status" -ne 0 ]; then
-    printf 'Expected same-inode no-complete rewrite to defer safely, got %s\n' "$status" >&2
-    exit 1
-  fi
-
-  assert_file_exists "$hook_state/rewrite.identity"
-  if [ "$(/usr/bin/stat -f '%d:%i' "$source_path")" != "$source_identity" ]; then
-    printf 'Expected no-complete rewrite to retain the source inode\n' >&2
-    exit 1
-  fi
-  cmp -s "$expected_rewrite" "$source_path"
-  cmp -s "$expected_mirror" "$mirror_path"
-  if [ "$(/usr/bin/stat -f '%d:%i' "$mirror_path")" != "$mirror_identity" ] || \
-    [ "$(/usr/bin/stat -f%Lp "$mirror_path")" != "$mirror_mode" ] || \
-    [ "$(/usr/bin/stat -f%m "$mirror_path")" != "$mirror_mtime" ]; then
-    printf 'Expected deferred no-complete rewrite to preserve old mirror identity and metadata\n' >&2
-    exit 1
-  fi
-  assert_contains "$log_path" \
-    "Source rollout disappeared during mirror sync, skipping: sessions/day/rollout-no-complete-rewrite.jsonl"
-  assert_not_contains "$log_path" \
-    "Mirror source has no complete line, retaining current mirror: sessions/day/rollout-no-complete-rewrite.jsonl"
-  assert_archive_not_contains "$archive_path" "sessions/day/rollout-no-complete-rewrite.jsonl"
-  assert_archive_contains "$archive_path" \
-    "sessions/day/rollout-stable-during-no-complete-rewrite.jsonl"
-  if find "$(dirname "$mirror_path")" -mindepth 1 -maxdepth 1 \
-    -type d -name '.*.codex-stage.*' -print -quit | grep -q .; then
-    printf 'Expected no private stage after deferred no-complete rewrite\n' >&2
-    exit 1
-  fi
-  if find "$tmp_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
-    printf 'Expected no private temp indexes after deferred no-complete rewrite\n' >&2
-    exit 1
-  fi
-
-  cleanup_home "$tmp_home"
-}
-
-test_snapshot_real_retry_converges_after_active_rollout_is_archived() {
-  local tmp_home rollout_id live_src archived_src live_mirror archived_mirror
-  local queue_path repair_receipt archive_path log_path
-
-  tmp_home="$(new_home)"
-  rollout_id="019e4f9b-d3cb-7c92-9637-722ebb48c3db"
-  live_src="$tmp_home/.codex/sessions/day/rollout-2026-08-17T12-00-00-$rollout_id.jsonl"
-  archived_src="$tmp_home/.codex/archived_sessions/rollout-2026-08-17T12-00-00-$rollout_id.jsonl"
-  live_mirror="$tmp_home/.dotfiles/codex-backup/mirror/sessions/day/$(basename "$live_src")"
-  archived_mirror="$tmp_home/.dotfiles/codex-backup/mirror/archived_sessions/$(basename "$live_src")"
-  queue_path="$tmp_home/.dotfiles/codex-backup/state/reflink-repair/retry-queue.json"
-  repair_receipt="$tmp_home/active-prefix-repair.json"
-  archive_path="$(snapshot_archive_path "$tmp_home")"
-  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
-
-  mkdir -p "$(dirname "$live_src")" "$(dirname "$archived_src")"
-  printf '{"step":1}\n{"step":2' > "$live_src"
-
-  HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
-  assert_file_exists "$live_mirror"
-  if [ "$(tail -c 1 "$live_mirror")" != "" ]; then
-    printf 'Expected active mirror to end at a complete newline boundary\n' >&2
-    exit 1
-  fi
-
-  HOME="$tmp_home" python3 "$REPO_ROOT/scripts/codex_repair_rollout_reflinks.py" \
-    repair --apply --queue-unstable --json > "$repair_receipt"
-  assert_file_exists "$queue_path"
-  assert_contains "$repair_receipt" '"classification":"active-complete-prefix"'
-  assert_contains "$queue_path" "$rollout_id"
-
-  mv "$live_src" "$archived_src"
-  printf '}\n' >> "$archived_src"
-  : > "$log_path"
-  HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
-
-  assert_not_exists "$live_mirror"
-  assert_file_exists "$archived_mirror"
-  cmp -s "$archived_src" "$archived_mirror"
-  assert_contains "$queue_path" '"entries":[]'
-  assert_contains "$log_path" '"outcome":"repaired"'
-  assert_archive_contains "$archive_path" "archived_sessions/$(basename "$live_src")"
-  assert_archive_not_contains "$archive_path" "sessions/day/$(basename "$live_src")"
-  assert_archive_file_equals "$archive_path" "archived_sessions/$(basename "$live_src")" "$archived_src"
-
-  cleanup_home "$tmp_home"
-}
-
-test_snapshot_keeps_existing_complete_mirror_when_source_has_no_complete_lines() {
-  local tmp_home src_file mirror_file expected_file log_path archive_path
-
-  tmp_home="$(new_home)"
-  src_file="$tmp_home/.codex/sessions/day/rollout-no-complete-lines.jsonl"
-  mirror_file="$tmp_home/.dotfiles/codex-backup/mirror/sessions/day/rollout-no-complete-lines.jsonl"
-  expected_file="$tmp_home/expected-no-complete-lines.jsonl"
-  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
-  mkdir -p "$(dirname "$src_file")"
-
-  printf '{"step":1}\n' > "$expected_file"
-  printf '{"step":1}\n' > "$src_file"
-  HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
-
-  printf '{"step":2' > "$src_file"
-  : > "$log_path"
-  HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
-
-  archive_path="$(snapshot_archive_path "$tmp_home")"
-  assert_not_contains "$log_path" "Mirror update sessions/day/rollout-no-complete-lines.jsonl (11 -> 0)"
-  assert_file_exists "$mirror_file"
-  cmp -s "$expected_file" "$mirror_file"
-  assert_archive_file_equals "$archive_path" "sessions/day/rollout-no-complete-lines.jsonl" "$expected_file"
-
-  cleanup_home "$tmp_home"
-}
-
 test_snapshot_waits_for_onedrive_readiness_before_unpin() {
   local tmp_home src_file archive_path log_path cli_path state_dir cloud_root
 
@@ -2364,166 +1655,19 @@ test_snapshot_waits_for_onedrive_readiness_before_unpin() {
   cleanup_home "$tmp_home"
 }
 
-test_snapshot_relocates_archived_rollout_and_prunes_duplicate_mirror() {
-  local tmp_home live_src archived_src live_mirror archived_mirror log_path archive_path
+test_snapshot_archives_empty_source() {
+  local tmp_home log_path archive_path
 
   tmp_home="$(new_home)"
-  live_src="$tmp_home/.codex/sessions/day/rollout-relocate.jsonl"
-  archived_src="$tmp_home/.codex/archived_sessions/rollout-relocate.jsonl"
-  live_mirror="$tmp_home/.dotfiles/codex-backup/mirror/sessions/day/rollout-relocate.jsonl"
-  archived_mirror="$tmp_home/.dotfiles/codex-backup/mirror/archived_sessions/rollout-relocate.jsonl"
+  mkdir -p "$tmp_home/.codex/sessions/empty"
   log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
-
-  mkdir -p "$(dirname "$live_src")" "$(dirname "$archived_src")"
-  printf '{"step":1}\n' > "$live_src"
-
-  HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
-
-  assert_file_exists "$live_mirror"
-
-  mv "$live_src" "$archived_src"
-  printf '{"step":2}\n' >> "$archived_src"
-  mkdir -p "$(dirname "$archived_mirror")"
-  cp -p "$live_mirror" "$archived_mirror"
-  : > "$log_path"
 
   HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
 
   archive_path="$(snapshot_archive_path "$tmp_home")"
-  assert_contains "$log_path" "Mirror update archived_sessions/rollout-relocate.jsonl"
-  assert_contains "$log_path" "Mirror prune stale duplicate sessions/day/rollout-relocate.jsonl -> archived_sessions/rollout-relocate.jsonl"
-  assert_not_exists "$live_mirror"
-  assert_file_exists "$archived_mirror"
-  cmp -s "$archived_src" "$archived_mirror"
-  assert_archive_contains "$archive_path" "archived_sessions/rollout-relocate.jsonl"
-  assert_archive_not_contains "$archive_path" "sessions/day/rollout-relocate.jsonl"
-  assert_archive_file_equals "$archive_path" "archived_sessions/rollout-relocate.jsonl" "$archived_src"
-
-  cleanup_home "$tmp_home"
-}
-
-test_snapshot_skips_disappeared_source_during_mirror_sync() {
-  local tmp_home disappearing_src disappearing_mirror stable_src log_path hook_path hook_state archive_path
-
-  tmp_home="$(new_home)"
-  disappearing_src="$tmp_home/.codex/sessions/day/rollout-disappear.jsonl"
-  disappearing_mirror="$tmp_home/.dotfiles/codex-backup/mirror/sessions/day/rollout-disappear.jsonl"
-  stable_src="$tmp_home/.codex/sessions/day/rollout-stable.jsonl"
-  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
-  hook_path="$tmp_home/fake-bin/disappear-hook"
-  hook_state="$tmp_home/hook-state"
-  mkdir -p "$(dirname "$disappearing_src")"
-  printf '{"step":"gone"}\n' > "$disappearing_src"
-  printf '{"step":"stay"}\n' > "$stable_src"
-  HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
-
-  assert_file_exists "$disappearing_mirror"
-  : > "$log_path"
-  setup_disappear_hook "$hook_path"
-
-  HOME="$tmp_home" \
-  CODEX_ROLLOUT_MIRROR_TEST_HOOK="$hook_path" \
-  TMP_MIRROR_HOOK_STATE="$hook_state" \
-  bash "$SNAPSHOT_SCRIPT"
-
-  archive_path="$(snapshot_archive_path "$tmp_home")"
-  assert_contains "$log_path" "Source rollout disappeared during mirror sync, skipping: sessions/day/rollout-disappear.jsonl"
-  assert_contains "$log_path" "Suppressing snapshot entry for disappeared rollout this pass: sessions/day/rollout-disappear.jsonl"
-  assert_archive_contains "$archive_path" "sessions/day/rollout-stable.jsonl"
-  assert_archive_not_contains "$archive_path" "sessions/day/rollout-disappear.jsonl"
-  assert_file_exists "$disappearing_mirror"
-
-  cleanup_home "$tmp_home"
-}
-
-test_snapshot_suppresses_delayed_relocation_after_disappear() {
-  local tmp_home live_src archived_src stable_src log_path hook_path hook_state archive_path
-
-  tmp_home="$(new_home)"
-  live_src="$tmp_home/.codex/sessions/day/rollout-relocate-disappear-snapshot.jsonl"
-  archived_src="$tmp_home/.codex/archived_sessions/rollout-relocate-disappear-snapshot.jsonl"
-  stable_src="$tmp_home/.codex/sessions/day/rollout-stable-relocate-snapshot.jsonl"
-  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
-  hook_path="$tmp_home/fake-bin/disappear-hook-relocate-snapshot"
-  hook_state="$tmp_home/hook-state-relocate-snapshot"
-  mkdir -p "$(dirname "$live_src")" "$(dirname "$archived_src")"
-  printf '{"step":1}\n' > "$live_src"
-  printf '{"stable":1}\n' > "$stable_src"
-  HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
-
-  mv "$live_src" "$archived_src"
-  printf '{"step":2}\n' >> "$archived_src"
-  : > "$log_path"
-  setup_disappear_hook "$hook_path"
-
-  HOME="$tmp_home" \
-  CODEX_ROLLOUT_MIRROR_TEST_HOOK="$hook_path" \
-  TMP_MIRROR_HOOK_STATE="$hook_state" \
-  TMP_MIRROR_HOOK_STAGE="before_copy" \
-  TMP_MIRROR_HOOK_TARGET_REL="archived_sessions/rollout-relocate-disappear-snapshot.jsonl" \
-  bash "$SNAPSHOT_SCRIPT"
-
-  archive_path="$(snapshot_archive_path "$tmp_home")"
-  assert_file_exists "$archive_path"
-  assert_not_contains "$log_path" "Mirror relocate sessions/day/rollout-relocate-disappear-snapshot.jsonl"
-  assert_contains "$log_path" "Source rollout disappeared during mirror sync, skipping: archived_sessions/rollout-relocate-disappear-snapshot.jsonl"
-  assert_contains "$log_path" "Suppressing snapshot entry for disappeared rollout this pass: sessions/day/rollout-relocate-disappear-snapshot.jsonl"
-  assert_archive_contains "$archive_path" "sessions/day/rollout-stable-relocate-snapshot.jsonl"
-  assert_archive_not_contains "$archive_path" "sessions/day/rollout-relocate-disappear-snapshot.jsonl"
-  assert_archive_not_contains "$archive_path" "archived_sessions/rollout-relocate-disappear-snapshot.jsonl"
-
-  cleanup_home "$tmp_home"
-}
-
-test_snapshot_suppresses_delayed_relocation_after_disappear_during_mirror_sync() {
-  local tmp_home live_src archived_src stable_src log_path hook_path hook_state archive_path
-
-  tmp_home="$(new_home)"
-  live_src="$tmp_home/.codex/sessions/day/rollout-relocate-disappear-snapshot-sync.jsonl"
-  archived_src="$tmp_home/.codex/archived_sessions/rollout-relocate-disappear-snapshot-sync.jsonl"
-  stable_src="$tmp_home/.codex/sessions/day/rollout-stable-relocate-snapshot-sync.jsonl"
-  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
-  hook_path="$tmp_home/fake-bin/disappear-hook-relocate-snapshot-sync"
-  hook_state="$tmp_home/hook-state-relocate-snapshot-sync"
-  mkdir -p "$(dirname "$live_src")" "$(dirname "$archived_src")"
-  printf '{"step":1}\n' > "$live_src"
-  printf '{"stable":1}\n' > "$stable_src"
-  HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
-
-  mv "$live_src" "$archived_src"
-  : > "$log_path"
-  setup_disappear_hook "$hook_path"
-
-  HOME="$tmp_home" \
-  CODEX_ROLLOUT_MIRROR_TEST_HOOK="$hook_path" \
-  TMP_MIRROR_HOOK_STATE="$hook_state" \
-  TMP_MIRROR_HOOK_STAGE="before_stat" \
-  TMP_MIRROR_HOOK_TARGET_REL="archived_sessions/rollout-relocate-disappear-snapshot-sync.jsonl" \
-  bash "$SNAPSHOT_SCRIPT"
-
-  archive_path="$(snapshot_archive_path "$tmp_home")"
-  assert_file_exists "$archive_path"
-  assert_not_contains "$log_path" "Mirror relocate sessions/day/rollout-relocate-disappear-snapshot-sync.jsonl"
-  assert_contains "$log_path" "Source rollout disappeared during mirror sync, skipping: archived_sessions/rollout-relocate-disappear-snapshot-sync.jsonl"
-  assert_contains "$log_path" "Suppressing snapshot entry for disappeared rollout this pass: sessions/day/rollout-relocate-disappear-snapshot-sync.jsonl"
-  assert_archive_contains "$archive_path" "sessions/day/rollout-stable-relocate-snapshot-sync.jsonl"
-  assert_archive_not_contains "$archive_path" "sessions/day/rollout-relocate-disappear-snapshot-sync.jsonl"
-  assert_archive_not_contains "$archive_path" "archived_sessions/rollout-relocate-disappear-snapshot-sync.jsonl"
-
-  cleanup_home "$tmp_home"
-}
-
-test_snapshot_skips_empty_source() {
-  local tmp_home log_path
-
-  tmp_home="$(new_home)"
-  mkdir -p "$tmp_home/.codex/sessions"
-  log_path="$tmp_home/Library/Logs/codex_snapshot_daily.log"
-
-  HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
-
   assert_file_exists "$log_path"
-  assert_contains "$log_path" "No mirrored rollout files found, skipping snapshot."
+  assert_file_exists "$archive_path"
+  assert_archive_path_exists "$archive_path" "sessions/empty"
   cleanup_home "$tmp_home"
 }
 
@@ -2659,6 +1803,7 @@ test_snapshot_accepts_computer_name_containing_reserved_name_substring() {
 
   tmp_home="$(new_home)"
   snapshot_dir="$tmp_home/OneDrive/Backup/dotfiles/codex/Mac mini construction/snapshots"
+  mkdir -p "$tmp_home/.codex/sessions"
 
   HOME="$tmp_home" CODEX_BACKUP_COMPUTER_NAME="Mac mini construction" bash "$SNAPSHOT_SCRIPT"
 
@@ -2997,20 +2142,105 @@ test_snapshot_rejects_symlink_staging_before_touching_target() {
   cleanup_home "$tmp_home"
 }
 
-test_snapshot_uses_existing_mirror_when_source_missing() {
-  local tmp_home archive_path mirror_file
+test_snapshot_rejects_source_root_symlink() {
+  local tmp_home real_root codex_root status
 
   tmp_home="$(new_home)"
-  mirror_file="$tmp_home/.dotfiles/codex-backup/mirror/sessions/day/rollout-from-mirror.jsonl"
-  mkdir -p "$(dirname "$mirror_file")"
-  printf '{"step":1}\n' > "$mirror_file"
+  real_root="$tmp_home/real-codex"
+  codex_root="$tmp_home/codex-link"
+  mkdir -p "$real_root/sessions"
+  ln -s "$real_root" "$codex_root"
 
-  HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
+  set +e
+  HOME="$tmp_home" CODEX_ROOT="$codex_root" bash "$SNAPSHOT_SCRIPT" \
+    > "$tmp_home/source-root.out" 2> "$tmp_home/source-root.err"
+  status=$?
+  set -e
 
-  archive_path="$(snapshot_archive_path "$tmp_home")"
+  if [ "$status" -ne 2 ]; then
+    printf 'Expected source root symlink to be rejected with status 2, got %s\n' "$status" >&2
+    exit 1
+  fi
+  assert_contains "$tmp_home/source-root.err" \
+    "Snapshot source root is not a non-symlink directory: $codex_root"
+  assert_not_exists "$(snapshot_archive_path "$tmp_home")"
+
+  cleanup_home "$tmp_home"
+}
+
+test_snapshot_rejects_source_tree_symlink() {
+  local tmp_home source_root sessions_link real_sessions status
+
+  tmp_home="$(new_home)"
+  source_root="$tmp_home/source-root"
+  sessions_link="$source_root/sessions"
+  real_sessions="$tmp_home/real-sessions"
+  mkdir -p "$source_root" "$real_sessions"
+  ln -s "$real_sessions" "$sessions_link"
+
+  set +e
+  HOME="$tmp_home" CODEX_ROOT="$source_root" bash "$SNAPSHOT_SCRIPT" \
+    > "$tmp_home/source-tree.out" 2> "$tmp_home/source-tree.err"
+  status=$?
+  set -e
+
+  if [ "$status" -ne 2 ]; then
+    printf 'Expected source tree symlink to be rejected with status 2, got %s\n' "$status" >&2
+    exit 1
+  fi
+  assert_contains "$tmp_home/source-tree.err" \
+    "Snapshot source path is not a non-symlink directory: $sessions_link"
+  assert_not_exists "$(snapshot_archive_path "$tmp_home")"
+
+  cleanup_home "$tmp_home"
+}
+
+test_snapshot_rejects_output_nested_inside_source() {
+  local tmp_home source_root snapshot_dir status
+
+  tmp_home="$(new_home)"
+  source_root="$tmp_home/source-root"
+  snapshot_dir="$source_root/sessions/snapshot-output"
+  mkdir -p "$source_root/sessions" "$source_root/archived_sessions"
+
+  set +e
+  HOME="$tmp_home" CODEX_ROOT="$source_root" CODEX_SNAPSHOT_DIR="$snapshot_dir" \
+    bash "$SNAPSHOT_SCRIPT" > "$tmp_home/nested-output.out" 2> "$tmp_home/nested-output.err"
+  status=$?
+  set -e
+
+  if [ "$status" -ne 2 ]; then
+    printf 'Expected nested snapshot output to be rejected with status 2, got %s\n' "$status" >&2
+    exit 1
+  fi
+  assert_contains "$tmp_home/nested-output.err" \
+    "Snapshot output path is inside Codex source tree: $snapshot_dir"
+
+  cleanup_home "$tmp_home"
+}
+
+test_snapshot_allows_output_symlink_alias_outside_source() {
+  local tmp_home source_root output_target output_alias archive_path
+
+  tmp_home="$(new_home)"
+  source_root="$tmp_home/source-root"
+  output_target="$tmp_home/onedrive-target"
+  output_alias="$source_root/output-alias"
+  mkdir -p "$source_root/sessions" "$source_root/archived_sessions" "$output_target"
+  printf 'source bytes\n' > "$source_root/sessions/file"
+  ln -s "$output_target" "$output_alias"
+
+  HOME="$tmp_home" CODEX_ROOT="$source_root" CODEX_SNAPSHOT_DIR="$output_alias" \
+    bash "$SNAPSHOT_SCRIPT"
+
+  archive_path="$output_target/codex-rollouts-$(date +%Y-%m-%d).tar"
+  if command -v zstd >/dev/null 2>&1; then
+    archive_path="$archive_path.zst"
+  else
+    archive_path="$archive_path.gz"
+  fi
   assert_file_exists "$archive_path"
-  assert_archive_contains "$archive_path" "sessions/day/rollout-from-mirror.jsonl"
-  assert_not_exists "$tmp_home/OneDrive/Backup/dotfiles/codex/sessions/day/rollout-from-mirror.jsonl"
+  assert_archive_file_equals "$archive_path" "sessions/file" "$source_root/sessions/file"
 
   cleanup_home "$tmp_home"
 }
@@ -3118,48 +2348,6 @@ test_sync_tolerates_missing_duplicate_mirror_during_stat() {
   cleanup_home "$tmp_home"
 }
 
-test_snapshot_handles_many_relocations_under_low_maxfiles() {
-  local tmp_home archive_path err_path sample_live sample_archived sample_id i
-
-  tmp_home="$(new_home)"
-  err_path="$tmp_home/low-maxfiles.err"
-  mkdir -p "$tmp_home/.codex/sessions/day" "$tmp_home/.codex/archived_sessions/batch"
-
-  for i in $(seq 1 160); do
-    printf -v sample_id '%03d' "$i"
-    printf '{"step":%s}\n' "$i" > "$tmp_home/.codex/sessions/day/rollout-fd-$sample_id.jsonl"
-  done
-
-  HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
-
-  for i in $(seq 1 160); do
-    printf -v sample_id '%03d' "$i"
-    mv \
-      "$tmp_home/.codex/sessions/day/rollout-fd-$sample_id.jsonl" \
-      "$tmp_home/.codex/archived_sessions/batch/rollout-fd-$sample_id.jsonl"
-    printf '{"archived":%s}\n' "$i" >> "$tmp_home/.codex/archived_sessions/batch/rollout-fd-$sample_id.jsonl"
-  done
-
-  (
-    ulimit -n 64
-    HOME="$tmp_home" bash "$SNAPSHOT_SCRIPT"
-  ) 2>"$err_path"
-
-  archive_path="$(snapshot_archive_path "$tmp_home")"
-  sample_live="sessions/day/rollout-fd-001.jsonl"
-  sample_archived="archived_sessions/batch/rollout-fd-001.jsonl"
-
-  assert_file_exists "$archive_path"
-  assert_file_exists "$tmp_home/.dotfiles/codex-backup/mirror/$sample_archived"
-  assert_not_exists "$tmp_home/.dotfiles/codex-backup/mirror/$sample_live"
-  assert_archive_contains "$archive_path" "$sample_archived"
-  assert_archive_not_contains "$archive_path" "$sample_live"
-  assert_not_contains "$err_path" "Too many open files"
-  assert_not_contains "$err_path" "Bad file descriptor"
-
-  cleanup_home "$tmp_home"
-}
-
 if [ -n "${CODEX_LAUNCHD_TEST_SELECTOR:-}" ]; then
   case "$CODEX_LAUNCHD_TEST_SELECTOR" in
     test_*) ;;
@@ -3178,33 +2366,24 @@ fi
 
 test_snapshot_skips_missing_source
 test_snapshot_disables_bytecode_writes_for_python_children
-test_snapshot_updates_mirror_and_archive_from_complete_lines
-test_snapshot_runs_recover_sync_retry_before_publish
-test_snapshot_stops_and_cleans_temps_when_reflink_retry_is_fatal
-test_snapshot_stops_before_sync_when_reflink_recovery_is_fatal
-test_snapshot_defers_safe_mirror_copy_without_pre_relocation
-test_snapshot_stops_when_safe_mirror_copy_is_fatal
+test_snapshot_archives_complete_source_trees_without_touching_mirror
+test_snapshot_archives_one_existing_source_tree
+test_snapshot_skips_when_both_source_trees_are_missing
+test_snapshot_does_not_publish_when_tar_fails
+test_snapshot_does_not_publish_when_zstd_fails
 test_snapshot_lock_rejects_unsafe_lock_leaves
 test_snapshot_lock_detects_path_replacement
 test_snapshot_lock_detects_state_ancestor_replacement
 test_snapshot_lock_rejects_concurrent_zstd_run
+test_snapshot_rejects_source_root_symlink
+test_snapshot_rejects_source_tree_symlink
+test_snapshot_rejects_output_nested_inside_source
+test_snapshot_allows_output_symlink_alias_outside_source
 test_sync_safe_helper_uses_apfs_reflink_and_absent_private_stage
 test_sync_safe_helper_rejects_inherited_destination_acl
 test_sync_requires_nonempty_log_before_touching_mirror_state
-test_snapshot_stops_on_partial_source_or_mirror_enumeration_failure
-test_snapshot_cleans_private_sync_indexes_on_setup_and_hook_failures
-test_snapshot_fails_closed_on_tab_newline_and_backslash_rollout_paths
-test_snapshot_rejects_unsafe_configured_rollout_roots_before_side_effects
-test_snapshot_defers_source_name_replacements_without_touching_old_mirror
-test_snapshot_defers_no_complete_same_inode_rewrite
-test_snapshot_real_retry_converges_after_active_rollout_is_archived
-test_snapshot_keeps_existing_complete_mirror_when_source_has_no_complete_lines
 test_snapshot_waits_for_onedrive_readiness_before_unpin
-test_snapshot_relocates_archived_rollout_and_prunes_duplicate_mirror
-test_snapshot_skips_disappeared_source_during_mirror_sync
-test_snapshot_suppresses_delayed_relocation_after_disappear
-test_snapshot_suppresses_delayed_relocation_after_disappear_during_mirror_sync
-test_snapshot_skips_empty_source
+test_snapshot_archives_empty_source
 test_snapshot_can_rerun_same_day
 test_snapshot_default_paths_follow_runtime_computer_name
 test_snapshot_explicit_directory_does_not_require_computer_name
@@ -3218,8 +2397,6 @@ test_snapshot_preserves_staging_file_when_publish_retries_are_exhausted
 test_snapshot_preserves_staging_file_when_publish_copy_fails
 test_snapshot_rotates_only_zstd_staging_files
 test_snapshot_rejects_symlink_staging_before_touching_target
-test_snapshot_uses_existing_mirror_when_source_missing
 test_sync_tolerates_missing_current_mirror_during_stat
 test_sync_tolerates_missing_duplicate_mirror_during_stat
-test_snapshot_handles_many_relocations_under_low_maxfiles
 test_install_generates_portable_launchd_plist
